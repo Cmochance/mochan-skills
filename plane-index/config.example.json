@@ -1,0 +1,9 @@
+{
+  "workspace_slug": "<workspace slug>",
+  "index_dir": "~/.claude/plane-index/<workspace slug>",
+  "api_key": "keychain: security find-generic-password -s plane-api-key -w",
+  "projects": {
+    "<PROJECT IDENTIFIER, e.g. ABC>": "<project uuid>",
+    "<ANOTHER IDENTIFIER>": "<project uuid>"
+  }
+}

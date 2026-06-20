@@ -1,0 +1,11 @@
+{
+  "workspace": "<workspace>",
+  "team": "<team key, e.g. ABC>",
+  "index_dir": "~/.claude/linear-index/<workspace slug>",
+  "api_key_path": "~/.config/linear/api_key",
+  "milestone_buckets": {
+    "followup":         {"name": "<followup milestone name>",         "id": "<uuid>"},
+    "user_feedback":    {"name": "<user feedback milestone name>",    "id": "<uuid>"},
+    "version_tracking": {"name": "<version tracking milestone name>", "id": "<uuid>"}
+  }
+}

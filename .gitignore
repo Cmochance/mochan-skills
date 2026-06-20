@@ -1,0 +1,12 @@
+# 实例/敏感配置(每个 skill 本地填,authoritative 不入库)
+**/config.local.*
+
+# 外部拷贝的 skill(非自建,不收录)
+ci-fix/
+
+# 本地知识库 / 生成数据(内部,不公开)
+transfer-bug-recorder/records/
+
+# 杂项
+.DS_Store
+*.log
