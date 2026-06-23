@@ -62,6 +62,15 @@ description: 逆向工程 / 授权安全研究 / CTF 的统一方法论与工具
 - `malware-supplychain.md` — YARA/Sigma/IOC + sandbox/行为分析;Trivy/Syft/Gitleaks/OSV 供应链
 - `ctf.md` — CTF 编排:按主导证据分流到 web/pwn/re/crypto/forensic/misc + writeup
 
+## 深度层 references/(高保真,清洗即保留;概览不够时进这里)
+
+上面的分域文件是**概览/导航层**;下面是从源仓库近原样移植、只剥了操纵/注入部分的**深度层**,信息密度高,按需读单文件:
+
+- `field-journal/` — 30 条脱敏实战 writeup(完整执行链 + 踩坑表 + 关键命令),含 reverse/pentest/CTF/IoT 案例。开工前先查 `field-journal/_index.md` 看有无同类先例可复用。
+- `playbooks/` — src-hunter 的 20 个漏洞猎杀 playbook(sqli/xss/ssrf/rce/file-upload/jwt/race/graphql/IDOR/内网后渗透 等,统计驱动、入口点全)+ `methodology/`(攻击优先级 / bypass 工具箱 / 证据纪律)。见 `playbooks/_index.md`。
+- `ctf/` — 41 个 CTF competition 题型深度库(每类的识别、套路、技术参考)。见 `ctf/_index.md`。
+- `deep/` — 两个高危进攻域的源深度移植:patch-diff(`patch-diff__*`,Patch Tuesday/diff 工具/根因)与 内网AD/C2(`adc2__*`,attack-chain/EDR/network-attack-defense)。概览见 `patch-diff-nday.md` / `network-ad-c2.md`,完整细节在此。见 `deep/_index.md`。
+
 ## 完成清单(交付前自检)
 
 - [ ] 实际跑了流程并产出**可复现**的命令/脚本/PoC(不是只描述步骤)

@@ -50,8 +50,18 @@
 - 不确定根因就说不确定,别脑补利用路径。
 - 影响评估只到"这类输入会触发问题 + 受影响版本范围",检测规则编写交给 `malware-supplychain.md` 的 YARA/Sigma 部分。
 
+## 深度(源移植,完整细节)
+
+本文是概览。完整深度在 `deep/`(源仓库 binary-diff / patch-diff-exploit 近原样移植):
+- `deep/patch-diff__patch-tuesday.md` — Patch Tuesday 完整工作流
+- `deep/patch-diff__diff-tools-comparison.md` — diff 工具逐项对比
+- `deep/patch-diff__binary-diff.md` — 跨版本符号迁移方法
+- `deep/patch-diff__symbol-migration-prompt.md` — LLM 辅助迁移提示词骨架
+- `deep/patch-diff__root-cause-and-poc.md` — 根因定位(研究向)
+
 ## 关联
 
 - 脱壳 / 反混淆 → `patterns.md`
 - 反编译/差分的二进制工具 → `binary-reverse.md`
 - 检测规则编写 → `malware-supplychain.md`
+- 完整案例 → `field-journal/_index.md`

@@ -71,7 +71,15 @@
 - 报告脱敏(主机名/IP/凭据占位化)。
 - 本 skill 提供编排判断与检测建议;具体武器化实现不在此文件,按授权工程在受控环境处理。
 
+## 深度(源移植,完整细节)
+
+本文是概念地图 + 检测视角的概览。完整深度在 `deep/`(源仓库 attack-chain / edr-bypass-re / network-attack-defense 近原样移植,授权工程内使用):
+- `deep/adc2__attack-chain.md` + `deep/adc2__attack-playbooks.md` — 完整攻击链编排与各阶段 playbook
+- `deep/adc2__evasion-cheatsheet.md` + `deep/adc2__edr-bypass.md`(+ `adc2__hook-survey.md` / `adc2__unhook-techniques.md` / `adc2__telemetry-blinding.md`)— EDR/AV 规避技术清单(防御评估用)
+- `deep/adc2__network-attack-defense.md` — 内网/AD/横向/提权/凭据/C2 综合参考
+
 ## 关联
 - Web/主机渗透前置 → `pentest.md`
 - EDR 规避的二进制层机制(研究)→ `binary-reverse.md` / `patterns.md`
 - 恶意流量/样本检测规则 → `malware-supplychain.md`
+- 完整案例 → `field-journal/_index.md`

@@ -1,0 +1,86 @@
+# CTF 题型深度库(41 competition) — 索引
+
+> 深度层(清洗即保留,近原样移植自源仓库)。按需读单个文件,别全量预载。
+
+- `_orchestrator-overview.md` — CTF Sandbox Orchestrator
+- `competition-ad-certificate-abuse__ad-certificate-abuse.md` — AD Certificate Abuse Checklist
+- `competition-ad-certificate-abuse.md` — Competition AD Certificate Abuse
+- `competition-agent-cloud__agent-cloud.md` — Agent, Toolchain, Cloud, And Supply-Chain Checklist
+- `competition-agent-cloud.md` — Competition Agent Cloud
+- `competition-android-hooking__android-hooking.md` — Android Hooking Checklist
+- `competition-android-hooking.md` — Competition Android Hooking
+- `competition-browser-persistence__browser-persistence.md` — Browser Persistence Checklist
+- `competition-browser-persistence.md` — Competition Browser Persistence
+- `competition-bundle-sourcemap-recovery__bundle-sourcemap-recovery.md` — Bundle And Sourcemap Recovery Checklist
+- `competition-bundle-sourcemap-recovery.md` — Competition Bundle Sourcemap Recovery
+- `competition-cloud-metadata-path__cloud-metadata-path.md` — Cloud Metadata Path Checklist
+- `competition-cloud-metadata-path.md` — Competition Cloud Metadata Path
+- `competition-container-runtime__container-runtime.md` — Container Runtime Checklist
+- `competition-container-runtime.md` — Competition Container Runtime
+- `competition-crypto-mobile__crypto-mobile.md` — Crypto, Stego, And Mobile Checklist
+- `competition-crypto-mobile.md` — Competition Crypto Mobile
+- `competition-custom-protocol-replay__custom-protocol-replay.md` — Custom Protocol Replay Checklist
+- `competition-custom-protocol-replay.md` — Competition Custom Protocol Replay
+- `competition-dpapi-credential-chain__dpapi-credential-chain.md` — DPAPI Credential Chain Checklist
+- `competition-dpapi-credential-chain.md` — Competition Dpapi Credential Chain
+- `competition-file-parser-chain__file-parser-chain.md` — File Parser Chain Checklist
+- `competition-file-parser-chain.md` — Competition File Parser Chain
+- `competition-firmware-layout__firmware-layout.md` — Firmware Layout Checklist
+- `competition-firmware-layout.md` — Competition Firmware Layout
+- `competition-forensic-timeline__forensic-timeline.md` — Forensic Timeline Checklist
+- `competition-forensic-timeline.md` — Competition Forensic Timeline
+- `competition-graphql-rpc-drift__graphql-rpc-drift.md` — Graphql And Rpc Drift Checklist
+- `competition-graphql-rpc-drift.md` — Competition Graphql Rpc Drift
+- `competition-identity-windows__identity-windows.md` — Identity, Windows, And Enterprise Messaging Checklist
+- `competition-identity-windows.md` — Competition Identity Windows
+- `competition-ios-runtime__ios-runtime.md` — iOS Runtime Checklist
+- `competition-ios-runtime.md` — Competition iOS Runtime
+- `competition-jwt-claim-confusion__jwt-claim-confusion.md` — JWT Claim Confusion Checklist
+- `competition-jwt-claim-confusion.md` — Competition JWT Claim Confusion
+- `competition-k8s-control-plane__k8s-control-plane.md` — K8s Control Plane Checklist
+- `competition-k8s-control-plane.md` — Competition K8s Control Plane
+- `competition-kerberos-delegation__kerberos-delegation.md` — Kerberos Delegation Checklist
+- `competition-kerberos-delegation.md` — Competition Kerberos Delegation
+- `competition-kernel-container-escape__kernel-container-escape.md` — Kernel Container Escape Checklist
+- `competition-kernel-container-escape.md` — Competition Kernel Container Escape
+- `competition-linux-credential-pivot__linux-credential-pivot.md` — Linux Credential Pivot Checklist
+- `competition-linux-credential-pivot.md` — Competition Linux Credential Pivot
+- `competition-lsass-ticket-material__lsass-ticket-material.md` — LSASS Ticket Material Checklist
+- `competition-lsass-ticket-material.md` — Competition LSASS Ticket Material
+- `competition-mailbox-abuse__mailbox-abuse.md` — Mailbox Abuse Checklist
+- `competition-mailbox-abuse.md` — Competition Mailbox Abuse
+- `competition-malware-config__malware-config.md` — Malware Config And Staging Checklist
+- `competition-malware-config.md` — Competition Malware Config
+- `competition-oauth-oidc-chain__oauth-oidc-chain.md` — OAuth OIDC Chain Checklist
+- `competition-oauth-oidc-chain.md` — Competition OAuth OIDC Chain
+- `competition-pcap-protocol__pcap-protocol.md` — PCAP Protocol Checklist
+- `competition-pcap-protocol.md` — Competition PCAP Protocol
+- `competition-prompt-injection__prompt-injection.md` — Prompt Injection And Tool Boundary Checklist
+- `competition-prompt-injection.md` — Competition Prompt Injection
+- `competition-queue-worker-drift__queue-worker-drift.md` — Queue Worker Drift Checklist
+- `competition-queue-worker-drift.md` — Competition Queue Worker Drift
+- `competition-race-condition-state-drift__race-condition-state-drift.md` — Race Condition State Drift Checklist
+- `competition-race-condition-state-drift.md` — Competition Race Condition State Drift
+- `competition-relay-coercion-chain__relay-coercion-chain.md` — Relay Coercion Checklist
+- `competition-relay-coercion-chain.md` — Competition Relay Coercion Chain
+- `competition-request-normalization-smuggling__request-normalization-smuggling.md` — Request Normalization Smuggling Checklist
+- `competition-request-normalization-smuggling.md` — Competition Request Normalization Smuggling
+- `competition-reverse-pwn__reverse-pwn.md` — Reverse, DFIR, And Pwn Playbook
+- `competition-reverse-pwn.md` — Competition Reverse Pwn
+- `competition-runtime-routing__runtime-routing.md` — Runtime Routing Checklist
+- `competition-runtime-routing.md` — Competition Runtime Routing
+- `competition-ssrf-metadata-pivot__ssrf-metadata-pivot.md` — SSRF Metadata Pivot Checklist
+- `competition-ssrf-metadata-pivot.md` — Competition SSRF Metadata Pivot
+- `competition-stego-media__stego-media.md` — Stego Media Checklist
+- `competition-stego-media.md` — Competition Stego Media
+- `competition-supply-chain__supply-chain.md` — Supply Chain And CI Checklist
+- `competition-supply-chain.md` — Competition Supply Chain
+- `competition-template-render-path__template-render-path.md` — Template Render Path Checklist
+- `competition-template-render-path.md` — Competition Template Render Path
+- `competition-web-runtime__cookie-hmac-key-reuse-auth-bypass.md` — Cookie HMAC 密钥复用 → 后台认证绕过
+- `competition-web-runtime__routing-runtime.md` — Routing And Runtime Checklist
+- `competition-web-runtime.md` — Competition Web Runtime
+- `competition-websocket-runtime__websocket-runtime.md` — WebSocket Runtime Checklist
+- `competition-websocket-runtime.md` — Competition WebSocket Runtime
+- `competition-windows-pivot__windows-pivot.md` — Windows Pivot And Kerberos Checklist
+- `competition-windows-pivot.md` — Competition Windows Pivot
