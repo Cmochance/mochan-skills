@@ -1,4 +1,4 @@
-# CTF 题型深度库(41 competition) — 索引
+# CTF 题型深度库(40 competition 题型 + orchestrator 总览) — 索引
 
 > 深度层(清洗即保留,近原样移植自源仓库)。按需读单个文件,别全量预载。
 

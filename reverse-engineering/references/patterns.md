@@ -147,7 +147,7 @@ case 10: R0 = getc(); break;        // INPUT
 | `0xB7E15163` | RC5/RC6 magic |
 | `0x61707865`("expa","expand 32-byte k") | ChaCha20 / Salsa20 |
 | `0xC6EF3720` | XTEA(32 轮后的 sum) |
-| `0x85EBCA6B` `0xA97288ED` | MurmurHash3 finalizer 常量 |
+| `0x85EBCA6B` | MurmurHash3 finalizer 常量(`0xA97288ED` 是相关哈希常量) |
 | `0x1b` / `0x11b` | GF(2^8) AES 约简多项式(看到即 Galois Field 运算) |
 | `0xcbf29ce484222325` / `5381` | FNV / DJB2 哈希(常见于 hash-resolved import) |
 | `0x2545F4914F6CDD1D` | xorshift64* 乘子 |
