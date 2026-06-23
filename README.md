@@ -8,6 +8,7 @@ Cmochance 自建的 Claude Code skill 集合。每个 skill 采用**两层结构
 - **plane-index** —— Plane work item 本地索引:同上,适配 Plane(原生归档、无限 issue、PQL、external_id 回链)。
 - **transfer-bug-recorder** —— 按 Codex 桌面 UI 报错语句分类/记录 bug 的方法与知识库结构。
 - **codex-e2e-test** —— 经 CDP 注入驱动真实运行的 Codex Desktop 跑一轮对话做 E2E/冒烟。
+- **reverse-engineering** —— 逆向 / 授权安全研究 / CTF 的方法论与工具路由:`SKILL.md` 入口按目标分流,`references/` 分域(二进制/语言运行时/移动端/JS 前端/固件/模式识别/pwn/patch-diff/授权渗透/内网AD/LLM安全/game/恶意样本与供应链/CTF)。改写自社区 `reverse-skill`,**剥除了其全局注入 / 服从性工程 / 安全护栏绕过**机制,只保留知识价值;高危进攻域收敛在方法论+检测视角。
 
 ## 安装
 1. 复制对应目录到 `~/.claude/skills/`。

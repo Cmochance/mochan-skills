@@ -1,0 +1,23 @@
+{
+  "_comment": "复制为 config.local.json 并填本机实际值(不进版本库)。记录本机已装工具的绝对路径/版本,供本 skill 用前查证、避免猜路径。",
+  "tools": {
+    "jadx": { "path": "", "version": "", "verify": "jadx --version" },
+    "apktool": { "path": "", "version": "", "verify": "apktool --version" },
+    "radare2": { "path": "", "version": "", "verify": "r2 -v" },
+    "ghidra": { "path": "", "version": "", "verify": "ghidraRun" },
+    "ida": { "path": "", "version": "", "verify": "" },
+    "frida": { "path": "", "version": "", "verify": "frida --version" },
+    "adb": { "path": "", "version": "", "verify": "adb --version" },
+    "nmap": { "path": "", "version": "", "verify": "nmap --version" },
+    "nuclei": { "path": "", "version": "", "verify": "nuclei -version" },
+    "burpsuite": { "path": "", "version": "", "verify": "" }
+  },
+  "mcp_servers": {
+    "ida-pro-mcp": { "enabled": false, "endpoint": "http://127.0.0.1:13337/mcp" },
+    "ghidra-mcp": { "enabled": false, "endpoint": "http://127.0.0.1:8765" },
+    "jshookmcp": { "enabled": false, "transport": "stdio" },
+    "anything-analyzer": { "enabled": false, "endpoint": "http://localhost:23816/mcp" },
+    "burpsuite": { "enabled": false, "endpoint": "http://127.0.0.1:9876" }
+  },
+  "notes": "MCP 服务默认 disabled;启用前用户确认并注册到对应客户端 MCP 配置。端口以本机实际为准。"
+}
