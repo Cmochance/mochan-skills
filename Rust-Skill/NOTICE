@@ -1,0 +1,81 @@
+Rust-Skill — 第三方来源与许可归属
+================================================================
+
+本 skill 的知识库整合了多个开源 Rust 学习资源。各源许可与处理方式如下。
+凡逐字/近原样移植的内容,均保留其原许可要求的归属与许可声明。
+
+----------------------------------------------------------------
+1. references/rules/  —  逐字移植
+----------------------------------------------------------------
+来源: leonardomso/rust-skills  (https://github.com/leonardomso/rust-skills)
+许可: MIT License — Copyright (c) 2025 Leonardo Maldonado
+处理: 265 条规则 Markdown 文件逐字移植到 references/rules/。
+
+  MIT License
+
+  Copyright (c) 2025 Leonardo Maldonado
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+----------------------------------------------------------------
+2. references/deep/  —  近原样移植(MPL-2.0,保文件边界 + 头部 notice)
+----------------------------------------------------------------
+来源: rust-unofficial/patterns —《Rust Design Patterns》
+      (https://github.com/rust-unofficial/patterns)
+许可: Mozilla Public License 2.0 (MPL-2.0)
+处理: 选取的章节(idioms / patterns / anti-patterns / refactoring)按 MPL-2.0
+      逐文件移植到 references/deep/,每个文件头部保留来源与 MPL-2.0 声明。
+      MPL-2.0 是文件级 copyleft:这些文件的修改需在同文件以 MPL-2.0 继续开放;
+      与本仓其余内容相互独立,不传染。
+许可全文: https://www.mozilla.org/en-US/MPL/2.0/
+
+----------------------------------------------------------------
+3. references/recipes/  —  借鉴(自行编写,致谢来源)
+----------------------------------------------------------------
+来源: The Rust Cookbook  (https://github.com/rust-lang-nursery/rust-cookbook)
+许可: Creative Commons Zero v1.0 Universal (CC0-1.0,公有领域)
+处理: 配方主题与组织借鉴 Cookbook;代码示例为本 skill 自行编写并查证,
+      CC0 无署名义务,出于尊重在 recipes/_index.md 致谢。
+
+----------------------------------------------------------------
+4. references/examples/  —  借鉴(自行编写,致谢来源)
+----------------------------------------------------------------
+来源: Rust by Example  (https://github.com/rust-lang/rust-by-example)
+许可: MIT OR Apache-2.0(双许可)
+处理: 概念组织借鉴 RBE;示例为本 skill 自行编写。RBE 内容若有逐字引用之处
+      保留 MIT/Apache-2.0 署名。
+
+----------------------------------------------------------------
+5. 架构思路  —  仅借鉴结构,无文字拷贝
+----------------------------------------------------------------
+来源: actionbook/rust-skills  (https://github.com/actionbook/rust-skills)
+说明: 本 skill 的"router-first + 三层认知(语言机制/工程设计/领域)+ 错误码索引"
+      组织思路受其启发。该仓库未声明开源许可,故本 skill **未拷贝其任何文本**,
+      仅借鉴不受版权保护的结构/分类思路,全部文字独立撰写。
+
+----------------------------------------------------------------
+其它参考(链接与导览层借鉴,未移植正文)
+----------------------------------------------------------------
+- Rust API Guidelines (MIT/Apache-2.0) — API 设计准则
+- cheats.rs — Rust 语言速查
+- mre/idiomatic-rust (CC0) — 惯用法精选索引
+- The Rust Programming Language / Rustonomicon / std 文档 — 官方权威参考
+
+本 skill 自身(导航层、路由、索引、原创说明文字)版权归 Cmochance,
+作为 mochan-skills 仓库的一部分发布。

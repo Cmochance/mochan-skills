@@ -1,0 +1,29 @@
+{
+  "_comment": "复制为 config.local.json 并填本机实际值(不进版本库)。记录本机工具链/工具的版本与路径,供本 skill 用前查证、避免猜。",
+  "toolchain": {
+    "default": { "channel": "stable", "version": "", "verify": "rustc -V" },
+    "msrv": { "version": "", "_note": "项目最低支持 rustc 版本(若有)" },
+    "nightly": { "installed": false, "verify": "rustup toolchain list" },
+    "targets": []
+  },
+  "components": {
+    "rustfmt": { "installed": false, "verify": "cargo fmt --version" },
+    "clippy": { "installed": false, "verify": "cargo clippy --version" },
+    "rust-analyzer": { "installed": false, "verify": "rust-analyzer --version" },
+    "miri": { "installed": false, "verify": "cargo +nightly miri --version" }
+  },
+  "tools": {
+    "cargo-nextest": { "path": "", "version": "", "verify": "cargo nextest --version" },
+    "cargo-expand": { "path": "", "version": "", "verify": "cargo expand --version" },
+    "cargo-flamegraph": { "path": "", "version": "", "verify": "cargo flamegraph --version" },
+    "cargo-machete": { "path": "", "version": "", "verify": "cargo machete --version" },
+    "bacon": { "path": "", "version": "", "verify": "bacon --version" },
+    "hyperfine": { "path": "", "version": "", "verify": "hyperfine --version" }
+  },
+  "mcp_servers": {
+    "rust-analyzer-lsp": { "enabled": false, "_note": "代码导航/类型查询;优先于 grep" },
+    "serena": { "enabled": false, "_note": "符号级语义工具" },
+    "codegraph": { "enabled": false, "_note": "已索引代码图" }
+  },
+  "notes": "MCP/LSP 默认 disabled;启用前用户确认并注册到对应客户端 MCP 配置。版本/路径以本机实际为准。"
+}
