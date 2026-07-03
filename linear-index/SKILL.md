@@ -13,7 +13,7 @@ description: 本地 Linear issue 索引。需要定位、查找、回忆 Linear 
 - `meta.json` — `last_sync`(ISO 时间)、`team`、统计 `counts`(total / archived / 按 statusType 分布)
 
 issues.jsonl 每行字段:
-`id`(如 `ABC-N`)、`title`、`status`、`statusType`(triage|backlog|unstarted|started|completed|canceled)、`priority`、`labels`、`project`、`milestone`、`archivedAt`(null=未归档)、`createdAt`、`updatedAt`、`completedAt`、`canceledAt`、`url`、`desc`(description 截断 ≤400 字符、已去换行)
+`id`(如 `ABC-N`)、`title`、`status`、`statusType`(triage|backlog|unstarted|started|completed|canceled)、`priority`、`labels`、`project`、`milestone`、`archivedAt`(null=未归档)、`createdAt`、`updatedAt`、`completedAt`、`canceledAt`、`url`、`desc`(description 截断 ≤500 字符、已去换行;新规范下 description 本身 < 450,整段即入索引)
 
 ## 查询(默认路径)
 
@@ -36,7 +36,7 @@ issues.jsonl 每行字段:
 - upsert/重算用 python3 临时脚本处理(MCP 返回 JSON → 挑字段 → JSONL),不要手工逐条转写
 - **大返回必走落盘文件**:limit 250 的返回会超 token 上限被 harness 自动落盘到 `tool-results/mcp-linear-list_issues-*.txt`,tool result 里给出路径——直接让 python 读该文件转换,零上下文消耗,这是常态路径不是错误;小增量(几条)返回会直接进上下文,同样用 python heredoc 内联数据处理
 
-字段映射(MCP 返回 → 索引):`priority` 取 `.priority.name`,`milestone` 取 `.projectMilestone.name`,`desc` 取 `.description` 去换行后截 400 字符;`assignee`/`createdBy`/`team`/`gitBranchName`/`sla*` 不入索引。
+字段映射(MCP 返回 → 索引):`priority` 取 `.priority.name`,`milestone` 取 `.projectMilestone.name`,`desc` 取 `.description` 去换行后截 500 字符;`assignee`/`createdBy`/`team`/`gitBranchName`/`sla*` 不入索引。
 
 ## 归档
 
@@ -60,7 +60,7 @@ issues.jsonl 每行字段:
 
 ## 配套写入规范
 
-自建 issue 的 description 按双区结构写:前 400 字符是「索引区」(症状原文关键词 + 组件 / 协议名 + 关联编号 + 中英别名双写),`---` 分隔后才是正文。这样较新自建 issue 的 `desc` 字段头部就是高密度检索词,关键词搜索优先信任它;老 issue(规范生效前)的 `desc` 可能是背景叙事开头,搜不到时退回 title 搜索或 MCP `query` 直查。
+自建 issue 的 description **严格 < 450 字符**,写成**单段自包含索引摘要**(症状原文关键词 + 组件 / 协议名 + 关联编号 + 中英别名双写),**不再写 `---` 后的长正文**;背景 / 排查 / 实现方案等详情一律进评论(`save_comment`)。**Why**:Linear MCP `list_issues` / `search` 对 description 有显示上限——超过约 500 字符就截到 **450 字符** + 追加 ` (truncated, use get_issue for full description)`;description < 450 → 日常 `list_issues` 定位单次即拿到完整 description,免多一轮 `get_issue`。这样 `desc` 字段整段就是高密度检索词,关键词搜索直接信任它;老 issue(规范生效前 / 双区时代)的 `desc` 可能是背景叙事或被截断,搜不到时退回 title 搜索或 MCP `query` 直查。**不批量迁移历史 issue**(2026-07-03 用户明示),只在经手时顺手压到 < 450。
 
 ## 硬性规则
 
