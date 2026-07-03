@@ -137,3 +137,25 @@ driver 只读 `[data-local-conversation-final-assistant]` 文本,有两个盲区
 - 读回 = `[data-local-conversation-final-assistant]` 克隆后剥用户气泡 + 时间戳叶子;兜底用 `[data-user-message-bubble]` + 排除 composer 的滚动容器。
 - 移除会话 = thread 行(`[data-app-action-sidebar-thread-id]`)fiber 的 `onArchive()`。
 - 端口 = `~/Library/Application Support/Codex/DevToolsActivePort` 首行(`portFile()` 写死此 macOS 路径)。**Windows 端无此文件 → 在 `%USERPROFILE%\Library\Application Support\Codex\DevToolsActivePort` 造同名文件、写入从 Codex.exe 命令行查到的端口,即可零改 driver 在 Windows 本地跑(见上「Windows 端测试」)。**
+
+---
+
+## 来自 auto-memory 的实证补充(2026-07-03 迁移,如与上文重复以上文为准)
+
+**`codex-e2e-test` skill**(`~/.claude/skills/codex-e2e-test/`,2026-06-16 建,用户需求)= 用 CDP 驱动**真实运行的** Codex Desktop 跑一轮对话、读回 assistant 回复,对 codex-app-transfer 的 Codex 集成做 E2E/冒烟测试,替代手搓 E2E。需要在真机 Codex 实测某 prompt/行为效果时用(`Skill` 调 `codex-e2e-test`,或直接跑 driver)。
+
+- driver:`~/.claude/skills/codex-e2e-test/codex-driver.mjs`(**零依赖**,Node ≥20 内建 `WebSocket`)。命令:
+  - `run-isolated "<prompt>" [--timeout 180] [--keep]` —— 新建独立会话→灌 prompt→提交→读最终回复→**精准归档测试会话**。默认推荐。
+  - `run-here "<prompt>"` —— 当前会话测,**绝不归档**(保护用户已有会话)。
+  - `status` / `archive <thread-id>`。
+- 输出末行 JSON:`{ok, reply, threadId, timedOut, archived, archiveNote, [rawTail, note]}`。
+- **精准清理安全闸**:run-isolated 归档前确认目标 thread-id **不在运行前已存在的集合**里(证明是新建的)才 `onArchive`;捕获不到新 id 就**跳过归档**不乱删。归档=Codex 原生 archive(可恢复,非硬删)。
+
+**关键实证 —— Codex 轮次「完成」的可靠信号**:
+- ❌ **不要**单靠 fiber `isSubmitting`:它在 streaming/Thinking 阶段就提前读 `false` → 会误判完成、抓到空回复。
+- ✅ 用 **`[data-local-conversation-final-assistant]`** 在场且有非空文本作完成信号 —— Codex 在**最终** assistant 答案渲染好后才打该标记(Thinking/跑工具/等批准期间不在)。该 skill 修复 + MOC-249 远程控制 daemon 完成判定都改用它(`driver.rs` Snapshot.final_ready)。
+- 回复提取:`[data-local-conversation-final-assistant]` 克隆后剥 `[data-user-message-bubble]` + 时间戳叶子(否则 "42"+"10:58 PM" innerText 粘成 "4210:58 PM" 全数字切不开);兜底用 `[data-user-message-bubble]` + 排除含 `.ProseMirror` 的滚动容器(避免圈进 composer 的 Approve/模型选择/Thinking 噪声)。
+- 会话移除 = 侧栏 thread 行(`[data-app-action-sidebar-thread-id]`)fiber 的 `onArchive()`;活动行 `data-app-action-sidebar-thread-active="true"`;id 形如 `local:<uuid>`。
+- 端口 = `~/Library/Application Support/Codex/DevToolsActivePort` 首行(仅 macOS);需 Codex 经 transfer 带 `--remote-debugging-port` 启动(开任一 CDP 功能)。
+
+相关:[[reference_codex_renderer_drive_feasibility]](composer/submit/CSP/沙箱基础事实)、[[reference_codex_persisted_atom_global_state]]。

@@ -6,6 +6,8 @@ description: 本地 Linear issue 索引。需要定位、查找、回忆 Linear 
 # Linear 本地索引
 
 > **实例配置**(workspace / team / 索引目录 / 归桶 milestone 映射 / api key 路径)读本目录 `config.local.json`(模板见 `config.example.json`)。下文凡出现 `config.<字段>` 均指读该文件对应字段;示例命令里的 `<index dir>` 替换为 `config.index_dir`。
+>
+> **PM conventions**(issue 自动配置 3 桶制 + milestone id 表 / description <450 规范 / followup 建档 / logclose / GitHub↔Linear 同步机制)见本目录 `config.local.pm-conventions.md` —— 创建或更新 issue、merge 收尾 transition 前先读它。
 
 索引位置:`config.index_dir`(如 `~/.claude/linear-index/<workspace slug>/`)
 

@@ -65,3 +65,14 @@ is_transfer_bug: false   # 是否真 transfer 代码 bug(false=环境/外部,别
 - **修复**:...
 - **关联**:`records/<其它记录 slug>.md` / issue 编号 / commit
 ```
+
+---
+
+## 来自 auto-memory 的实证补充(2026-07-03 迁移,如与上文重复以上文为准)
+
+`~/.claude/skills/transfer-bug-recorder/`(2026-06-17 建)。把「Codex 桌面界面有明确报错语句」的 transfer 问题做成可检索知识库:**按报错语句建索引,命中已知记录直接给分类+排查路径+根因;未命中按方法论诊断、完事归档一条**。
+
+- **何时用**:遇到/排查 Codex 界面报错(`stream disconnected before completion` / `error sending request for url` / `Reconnecting N/5` / HTTP 4xx-5xx / `Thinking` 卡死等),或刚诊断完这类 bug 要存档。
+- 结构:`SKILL.md`(分类引导表 + 排查方法论 + 记录模板)+ `records/INDEX.md`(报错语句索引,`rg` 匹配)+ `records/<slug>.md`(每条 bug 详录)。
+- 排查方法论核心:① 报错先定"层"(`error sending request`=传输层、先问 Codex 连到哪);② **监控 Codex 进程真实 TCP 连接(`Get-NetTCPConnection` by Codex/codex pid)是最决定性一招**;③ 代码+测试+真实观测缺一不可,别只看测试结果瞎猜。
+- 配套:[[reference_windows_test_machine_ssh_access]]、[[reference_codex_responses_ws_transport_fallback]]、skill `codex-e2e-test`。
