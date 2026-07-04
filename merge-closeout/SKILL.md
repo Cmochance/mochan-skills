@@ -179,7 +179,7 @@ mcp__linear__save_issue(
 
 #### 6.2 扫未完成 issue + 挂强相关链(**强制独立子步骤,不是 transition 的附属说明;跳过=收尾失职**)
 
-transition 完主 MOC-N 后,**必须真的执行一次 `mcp__linear__list_issues`** 拉 Linear 项目 codex-app-transfer 全部未完成态(`state` 分 In Progress / Todo / Backlog 几次拉过滤;量大常超 token 上限 → 会落到 tool-results 文件,用 `jq` 抽精简列表)。**禁止凭 "父/兄弟 issue 已 link" / "应该没强相关" 等 happy-path 借口跳过扫描本身** —— 没真扫 = 没做。
+transition 完主 MOC-N 后,**必须真的扫一次全部未完成态 issue**。**先走 `linear-index` skill 筛候选**(该 skill 的 description 明确「merge 收尾扫描相关 issue 时先走本索引」):按其 SOP 先做**增量刷新**(`meta.json` 的 `last_sync` 距今 >24h **必刷**,否则漏近期 issue —— 2026-07-04 实测索引 stale 18 天、直接用会漏当轮主 issue MOC-297 及全部关联项),再用 `jq` 在本地 `issues.jsonl` 筛未完成态候选(`statusType` ∈ backlog/unstarted/started 且 `archivedAt==null`),命中后按需 `mcp__linear__get_issue` 拉详情确认。索引不可用 / 怀疑损坏时才退回直连 `mcp__linear__list_issues`(`state` 分 In Progress / Todo / Backlog 几次拉;量大常超 token 上限 → 落 tool-results 文件,用 `jq` 抽精简列表)。**禁止凭 "父/兄弟 issue 已 link" / "应该没强相关" 等 happy-path 借口跳过扫描本身** —— 没真扫 = 没做。
 
 逐条按判定标准 judge,**挂不挂由你自行判断 + 直接执行;绝不把 "要不要挂" 抛回用户问**(这是收尾既定动作,不是决策点):
 - **挂**(`mcp__linear__save_issue` 的 `relatedTo` 参数追加关系 + `mcp__linear__save_comment` 一条简评,指向本 MOC-N+PR#、说清关系):同子系统(共享代码/文件/模块,带 file:line 佐证)/ 同根因不同面 / 互为前置后继。
@@ -219,7 +219,7 @@ mcp__linear__get_issue(id="MOC-<N>")  # state=Done (Linear status transitioned)
 
 报告必须带这 7 行 verify 的输出。
 
-**外加 step 6.2 自证(专防跳过扫描)**:报告必须写明「已 `mcp__linear__list_issues` 扫 **N** 条未完成态 → 判定强相关 **X** 条,已挂关系(`save_issue` 的 `relatedTo`)+简评(列出 MOC-…);其余无代码/根因耦合,不挂」。只写 "扫过了 / 无相关" 而**不带 {扫描条数 N + 强相关结论 X + 已挂清单}** = 视为没扫(2026-06-05 #401 凭 "父已 link" 跳过扫描的反例)。这一条让 6.2 跳过会在 verify 暴露,不再零成本。
+**外加 step 6.2 自证(专防跳过扫描)**:报告必须写明「已扫 **N** 条未完成态(经 `linear-index` 索引筛,先刷新;或索引不可用时直连 `mcp__linear__list_issues`)→ 判定强相关 **X** 条,已挂关系(`save_issue` 的 `relatedTo`)+简评(列出 MOC-…);其余无代码/根因耦合,不挂」。只写 "扫过了 / 无相关" 而**不带 {扫描条数 N + 强相关结论 X + 已挂清单}** = 视为没扫(2026-06-05 #401 凭 "父已 link" 跳过扫描的反例)。这一条让 6.2 跳过会在 verify 暴露,不再零成本。
 
 ### 常见踩坑
 
