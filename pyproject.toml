@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilibili-video-info-mcp"
+version = "0.2.0"
+description = "An MCP server to fetch Bilibili video information like subtitles, comments, and danmaku."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.11.0",
+    "requests",
+]
+authors = [
+    {name = "lesir"}
+]
+
+[project.scripts]
+bilibili-video-info-mcp = "bilibili_video_info_mcp.__main__:main"
+
+[tool.setuptools]
+packages = ["bilibili_video_info_mcp"]
