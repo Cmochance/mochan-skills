@@ -3,6 +3,8 @@
 
 # 外部拷贝的 skill(非自建,不收录)
 ci-fix/
+# lark-cli 安装的官方 skill symlink(指向 ~/.agents/skills/,由 lark-cli update 管理)
+lark-*
 
 # 本地知识库 / 生成数据(内部,不公开)
 transfer-bug-recorder/records/
