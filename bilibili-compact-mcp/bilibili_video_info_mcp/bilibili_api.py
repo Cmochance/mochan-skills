@@ -1,46 +1,57 @@
-import re
-import requests
-import xml.etree.ElementTree as ET
+import logging
+import math
 import os
+import re
+import xml.etree.ElementTree as ET
 
-def get_seesdata() -> str:
-    """Get the Bilibili SESSDATA from environment variables"""
-    seesdata = os.getenv("SESSDATA")
-    if not seesdata:
-        raise ValueError("SESSDATA environment variable is required")
-    return seesdata
+import requests
 
-SESSDATA = get_seesdata()
+from . import wbi
 
+logger = logging.getLogger(__name__)
 
 # Bilibili API endpoints
 API_GET_VIEW_INFO = "https://api.bilibili.com/x/web-interface/view"
 API_GET_SUBTITLE = "https://api.bilibili.com/x/player/wbi/v2"
-API_GET_DANMAKU = "https://api.bilibili.com/x/v1/dm/list.so"
-API_GET_COMMENTS = "https://api.bilibili.com/x/v2/reply"
+API_GET_DANMAKU_XML = "https://api.bilibili.com/x/v1/dm/list.so"
+API_GET_DANMAKU_SEG = "https://api.bilibili.com/x/v2/dm/web/seg.so"
+API_GET_COMMENTS = "https://api.bilibili.com/x/v2/reply/wbi/main"
+
+REQUEST_TIMEOUT = 15
+DANMAKU_SEG_DURATION = 360  # seg.so serves danmaku in 6-minute segments
 
 # Default Headers for requests
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
     'Referer': 'https://www.bilibili.com/'
 }
 
+
+def has_sessdata() -> bool:
+    return bool(os.getenv("SESSDATA"))
+
+
 def _get_headers():
+    # SESSDATA is optional: only the subtitle list requires a logged-in
+    # session; view/danmaku/comments work anonymously.
     headers = DEFAULT_HEADERS.copy()
-    if SESSDATA:
-        headers['Cookie'] = f'SESSDATA={SESSDATA}'
+    sessdata = os.getenv("SESSDATA")
+    if sessdata:
+        headers['Cookie'] = f'SESSDATA={sessdata}'
     return headers
+
 
 def extract_bvid(url):
     # 先尝试直接从URL中提取BV号
     match = re.search(r'BV[a-zA-Z0-9_]+', url)
     if match:
         return match.group(0)
-    
+
     # 如果是短链接（如b23.tv），则跟踪重定向获取完整URL
     if 'b23.tv' in url:
         try:
-            response = requests.head(url, headers=_get_headers(), allow_redirects=True)
+            response = requests.head(url, headers=_get_headers(), allow_redirects=True,
+                                     timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
                 # 获取最终重定向后的URL
                 final_url = response.url
@@ -48,89 +59,231 @@ def extract_bvid(url):
                 if match:
                     return match.group(0)
         except requests.RequestException as e:
-            print(f"Error resolving short URL: {e}")
-    
+            logger.warning("Error resolving short URL: %s", e)
+
     return None
 
-def get_video_basic_info(bvid):
-    """Gets aid and cid for a given bvid."""
-    headers = _get_headers()
+
+def get_video_view(bvid):
+    """Fetches the full view info (title, desc, stat, pages, ...) for a bvid."""
     try:
-        params_view = {'bvid': bvid}
-        response_view = requests.get(API_GET_VIEW_INFO, params=params_view, headers=headers)
-        response_view.raise_for_status()
-        data_view = response_view.json()
-
-        if data_view['code'] != 0:
-            return None, None, {'error': 'Failed to get video info', 'details': data_view}
-
-        video_data = data_view['data']
-        return video_data.get('aid'), video_data.get('cid'), None
+        response = requests.get(API_GET_VIEW_INFO, params={'bvid': bvid},
+                                headers=_get_headers(), timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if data['code'] != 0:
+            return None, {'error': 'Failed to get video info', 'details': data}
+        return data['data'], None
     except requests.RequestException as e:
-        return None, None, {'error': f'Failed to fetch video details: {e}'}
+        return None, {'error': f'Failed to fetch video details: {e}'}
 
-def get_subtitles(aid, cid):
-    """Fetches subtitles for a given aid and cid."""
+
+def select_page_cid(video_data, page=1):
+    """Resolves the cid of the given 1-based part (分P) number."""
+    pages = video_data.get('pages') or []
+    for p in pages:
+        if p.get('page') == page:
+            return p.get('cid'), None
+    if page == 1:
+        return video_data.get('cid'), None
+    return None, {'error': f'分P {page} 不存在，该视频共 {len(pages)} 个分P'}
+
+
+def get_subtitles(aid, cid, lang=None):
+    """Fetches one subtitle track (with timestamps) for a given aid and cid.
+
+    Prefers the requested lang, otherwise a zh variant, otherwise the first
+    track. Returns (result_dict, available_langs, error).
+    """
     headers = _get_headers()
-    subtitles = []
     try:
-        params_subtitle = {'aid': aid, 'cid': cid}
-        response_subtitle = requests.get(API_GET_SUBTITLE, params=params_subtitle, headers=headers)
-        response_subtitle.raise_for_status()
-        subtitle_data = response_subtitle.json()
-        if subtitle_data.get('code') == 0 and subtitle_data.get('data', {}).get('subtitle', {}).get('subtitles'):
-            for sub_meta in subtitle_data['data']['subtitle']['subtitles']:
-                if sub_meta.get('subtitle_url'):
-                    try:
-                        subtitle_json_url = f"https:{sub_meta['subtitle_url']}"
-                        response_sub_content = requests.get(subtitle_json_url, headers=headers)
-                        response_sub_content.raise_for_status()
-                        sub_content = response_sub_content.json()
-                        subtitle_body = sub_content.get('body', [])
-                        content_list = [item.get('content', '') for item in subtitle_body]
-                        subtitles.append({
-                            'lan': sub_meta['lan'],
-                            'content': content_list
-                        })
-                    except requests.RequestException as e:
-                        print(f"Could not fetch or parse subtitle content from {sub_meta.get('subtitle_url')}: {e}")
-        return subtitles, None
+        params = {'aid': aid, 'cid': cid}
+        response = requests.get(API_GET_SUBTITLE, params=params, headers=headers,
+                                timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        tracks = (data.get('data', {}).get('subtitle', {}) or {}).get('subtitles') or []
+        available = [t.get('lan') for t in tracks]
+        if not tracks:
+            return None, available, None
+
+        selected = None
+        if lang:
+            selected = next((t for t in tracks if t.get('lan') == lang), None)
+            if not selected:
+                return None, available, {'error': f'没有语言为 {lang} 的字幕，可用: {available}'}
+        else:
+            # 默认中文优先（zh-CN / zh-Hans / ai-zh 等），否则取第一条
+            selected = next((t for t in tracks if 'zh' in (t.get('lan') or '')), tracks[0])
+
+        subtitle_url = selected.get('subtitle_url') or ''
+        if subtitle_url.startswith('//'):
+            subtitle_url = f'https:{subtitle_url}'
+        response_content = requests.get(subtitle_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response_content.raise_for_status()
+        body = response_content.json().get('body', [])
+        lines = [{'t': item.get('from'), 'text': item.get('content', '')} for item in body]
+        return {'lan': selected.get('lan'), 'lines': lines}, available, None
     except requests.RequestException as e:
-        return [], {'error': f'Could not fetch subtitles: {e}'}
+        return None, [], {'error': f'Could not fetch subtitles: {e}'}
 
-def get_danmaku(cid):
-    """Fetches danmaku for a given cid."""
+
+# --- danmaku: protobuf seg.so (primary) with XML list.so fallback ---
+
+def _pb_read_varint(buf, i):
+    result = 0
+    shift = 0
+    while True:
+        b = buf[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, i
+        shift += 7
+
+
+def _pb_fields(buf):
+    """Yields (field_no, wire_type, value) over a protobuf message buffer."""
+    i = 0
+    n = len(buf)
+    while i < n:
+        key, i = _pb_read_varint(buf, i)
+        fno, wt = key >> 3, key & 7
+        if wt == 0:
+            val, i = _pb_read_varint(buf, i)
+        elif wt == 2:
+            ln, i = _pb_read_varint(buf, i)
+            val = buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            val = buf[i:i + 4]
+            i += 4
+        elif wt == 1:
+            val = buf[i:i + 8]
+            i += 8
+        else:
+            raise ValueError(f'unsupported wire type {wt}')
+        yield fno, wt, val
+
+
+def _parse_danmaku_elem(buf):
+    """Parses one DanmakuElem: progress(2, ms) midHash(6) content(7) ctime(8)."""
+    item = {'t': None, 'text': '', 'sent': None, 'user': None}
+    for fno, wt, val in _pb_fields(buf):
+        if fno == 2 and wt == 0:
+            item['t'] = round(val / 1000, 2)
+        elif fno == 6 and wt == 2:
+            item['user'] = val.decode('utf-8', errors='ignore')
+        elif fno == 7 and wt == 2:
+            item['text'] = val.decode('utf-8', errors='ignore')
+        elif fno == 8 and wt == 0:
+            item['sent'] = val
+    return item
+
+
+def _get_danmaku_seg(cid, duration):
+    """Fetches all danmaku via the segmented protobuf API (DmSegMobileReply)."""
     headers = _get_headers()
-    danmaku_list = []
-    try:
-        params_danmaku = {'oid': cid}
-        response_danmaku = requests.get(API_GET_DANMAKU, params=params_danmaku, headers=headers)
-        danmaku_content = response_danmaku.content.decode('utf-8', errors='ignore')
-        root = ET.fromstring(danmaku_content)
-        for d in root.findall('d'):
-            danmaku_list.append(d.text)
-        return danmaku_list, None
-    except (requests.RequestException, ET.ParseError) as e:
-        return [], {'error': f'Failed to get or parse danmaku: {e}'}
+    segments = max(1, math.ceil((duration or 0) / DANMAKU_SEG_DURATION))
+    items = []
+    for seg_index in range(1, segments + 1):
+        params = {'type': 1, 'oid': cid, 'segment_index': seg_index}
+        response = requests.get(API_GET_DANMAKU_SEG, params=params, headers=headers,
+                                timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        if 'octet-stream' not in response.headers.get('Content-Type', ''):
+            raise ValueError(f'unexpected content type for seg {seg_index}: '
+                             f'{response.headers.get("Content-Type")}')
+        for fno, wt, val in _pb_fields(response.content):
+            if fno == 1 and wt == 2:  # repeated DanmakuElem elems = 1
+                items.append(_parse_danmaku_elem(val))
+    return items
 
-def get_comments(aid):
-    """Fetches comments for a given aid."""
+
+def _get_danmaku_xml(cid):
+    """Legacy XML API (returns the most recent danmaku, capped)."""
+    response = requests.get(API_GET_DANMAKU_XML, params={'oid': cid},
+                            headers=_get_headers(), timeout=REQUEST_TIMEOUT)
+    content = response.content.decode('utf-8', errors='ignore')
+    root = ET.fromstring(content)
+    items = []
+    for d in root.findall('d'):
+        p = (d.get('p') or '').split(',')
+        items.append({
+            't': round(float(p[0]), 2) if p and p[0] else None,
+            'text': d.text or '',
+            'sent': int(p[4]) if len(p) > 4 else None,
+            'user': p[6] if len(p) > 6 else None,
+        })
+    return items
+
+
+def get_danmaku(cid, duration=None, limit=1000):
+    """Fetches danmaku from BOTH the segmented protobuf API and the legacy XML
+    API, merged and deduplicated.
+
+    实测（2026-07）两个接口返回的都是服务端筛选后的不同子集：seg 按权重精选、
+    XML 偏最近且有条数上限，交集极小，并集覆盖面明显更大，故双源合并。
+
+    Returns ({'source', 'total', 'returned', 'sampled', 'items'}, error).
+    Items over `limit` are uniformly sampled across the timeline.
+    """
+    items, sources, errors = [], [], []
+    seen = set()
+    for name, fetch in (('seg', lambda: _get_danmaku_seg(cid, duration)),
+                        ('xml', lambda: _get_danmaku_xml(cid))):
+        try:
+            fetched = fetch()
+        except (requests.RequestException, ET.ParseError, ValueError) as e:
+            logger.warning('%s danmaku fetch failed: %s', name, e)
+            errors.append(f'{name}: {e}')
+            continue
+        sources.append(name)
+        for it in fetched:
+            key = (it['text'], it['sent'], it['user'])
+            if key not in seen:
+                seen.add(key)
+                items.append(it)
+    if not sources:
+        return None, {'error': 'Failed to get danmaku: ' + '; '.join(errors)}
+    items.sort(key=lambda x: x['t'] if x['t'] is not None else 0)
+    source = '+'.join(sources)
+
+    total = len(items)
+    sampled = False
+    if limit and total > limit:
+        stride = total / limit
+        items = [items[int(i * stride)] for i in range(limit)]
+        sampled = True
+    return {'source': source, 'total': total, 'returned': len(items),
+            'sampled': sampled, 'items': items}, None
+
+
+def get_comments(aid, limit=20, mode=3):
+    """Fetches the top hot comments for a given aid via the WBI-signed API.
+
+    mode=3 按热度、mode=2 按时间。B站已把旧 x/v2/reply 降级为仅返回 3 条预览，
+    需走 WBI 签名的 reply/wbi/main 才能拿到完整首页（约 20 条）。更深翻页需 buvid
+    激活反爬处理，本 compact 版不做，仅返回热度最高的首页并按 limit 截断。
+    """
     headers = _get_headers()
     comments_list = []
     try:
-        params_comments = {'type': 1, 'oid': aid, 'sort': 2}  # sort=2 fetches hot comments
-        response_comments = requests.get(API_GET_COMMENTS, params=params_comments, headers=headers)
-        response_comments.raise_for_status()
-        comments_data = response_comments.json()
-        
-        if comments_data.get('code') == 0 and comments_data.get('data', {}).get('replies'):
-            for comment in comments_data['data']['replies']:
-                if comment.get('content', {}).get('message'):
-                    comments_list.append({
-                        'user': comment.get('member', {}).get('uname', 'Unknown User'),
-                        'content': comment['content']['message'],
-                        'likes': comment.get('like', 0)
-                    })
-        return comments_list, None
+        params = wbi.sign({'type': 1, 'oid': aid, 'mode': mode})
+        response = requests.get(API_GET_COMMENTS, params=params, headers=headers,
+                                timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        comments_data = response.json()
+        if comments_data.get('code') != 0:
+            return [], {'error': f"API error {comments_data.get('code')}: {comments_data.get('message')}"}
+
+        for comment in comments_data.get('data', {}).get('replies') or []:
+            if comment.get('content', {}).get('message'):
+                comments_list.append({
+                    'user': comment.get('member', {}).get('uname', 'Unknown User'),
+                    'content': comment['content']['message'],
+                    'likes': comment.get('like', 0)
+                })
+        return comments_list[:limit] if limit else comments_list, None
     except requests.RequestException as e:
         return [], {'error': f'Failed to get comments: {e}'}
