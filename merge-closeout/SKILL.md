@@ -79,8 +79,10 @@ fi
 
 # 1c. verify CI 已全绿,reviewDecision 不阻塞
 gh pr checks <PR#> --json bucket --jq 'all(.bucket=="pass")'
-# squash merge(项目默认 squash;subject 沿用 PR title 不改)
-gh pr merge <PR#> --squash --delete-branch
+# squash merge —— **不加 `--delete-branch`**(2026-07-08 收严,见下方 Why)。
+# merge 只做纯 API 合并;分支删除(本地+远端+worktree)统一下放 step 4 按正确顺序显式做。
+# subject 沿用 PR title 不改。
+gh pr merge <PR#> --squash
 ```
 
 **Why 展示 PR 这一步**: 用户 2026-05-26 显式指示 — 收尾时不能 ready+merge 一气呵成,先给 last-look 窗口。`gh pr view --web` 在浏览器开 PR 让用户能扫 review thread / Files Changed / Devin Review 评论;对话里同步报 URL + stats 是给用户一眼判断"哦这 PR 我没忘什么"的 anchor。展示完不需要等用户额外确认(merge 收尾指令就是确认),直接进 1b。
@@ -89,13 +91,18 @@ gh pr merge <PR#> --squash --delete-branch
 
 **已经 non-draft 的 PR**(老流程遗留 / 用户手动 `Create pull request` 非 draft 模式):`gh pr ready` 对已 ready 的 PR 会报 "already ready" 但 exit 0,流程安全,可无脑跑。
 
-`--delete-branch` 会同时删 GitHub 上远端 branch + 本地分支(如果 tracking)。如失败(分支保护 / chatgpt-codex unresolved thread)看 `~/.claude/CLAUDE.md` 顶部 "PR push 后必查 chatgpt-codex-connector review threads" 规则。
+**Why 不用 `--delete-branch`**(2026-07-08 收严,#590 实测根因):在 worktree session 里跑 `gh pr merge --squash --delete-branch`,gh 删完分支要把当前 repo 切回 main,但 main 已被主仓 worktree 占用 → 报 `fatal: 'main' is already used by worktree at ...` → **GitHub 侧 merge 其实已成功,但本地 + 远端分支删除全被 abort**(silent 残留,只能靠 step 4 事后手动补删,且远端残留极易漏)。根治办法 = **merge 只做纯 API 的 `--squash`**(无任何本地 git 副作用,不会失败),**分支删除全部下放 step 4**,按「先删 worktree 解锁 branch → 删本地 branch → 显式 `git push origin --delete` 删远端」的确定顺序做——每一步都有独立 verify,不再依赖 gh 的耦合删除。
+
+merge 本身失败(分支保护 / chatgpt-codex unresolved thread)另见 `~/.claude/CLAUDE.md` 顶部 "PR push 后必查 chatgpt-codex-connector review threads" 规则。
 
 ### 2. 把 worktree 内最新 .app 转移到主仓 dist/mac/(**必须加 `test ` 前缀**)
 
 ```bash
-WORKTREE=/Users/alysechen/alysechen/github/codex-app-transfer-worktrees/<branch>
 MAIN=/Users/alysechen/alysechen/github/codex-app-transfer
+# WORKTREE 路径动态反查(EnterWorktree 建的在 $MAIN/.claude/worktrees/<name>;别硬编码
+# 已废弃的 codex-app-transfer-worktrees 路径)。按 branch 名从 worktree list 取:
+WORKTREE=$(git -C "$MAIN" worktree list --porcelain | awk -v b="branch refs/heads/<branch>" '
+  /^worktree /{p=substr($0,10)} $0==b{print p}')
 mkdir -p "$MAIN/dist/mac"
 rm -rf "$MAIN/dist/mac/test Codex App Transfer.app"  # 老 test 版本清掉
 cp -R "$WORKTREE/dist/mac/Codex App Transfer.app" "$MAIN/dist/mac/test Codex App Transfer.app"
@@ -124,22 +131,32 @@ git pull --ff-only origin main  # squash 后 main HEAD 是新 commit
 **(2026-06-05 收严)清理本次任务涉及的【全部】分支/worktree,不只当前所在的那个** —— 收尾前先 `git worktree list` + `git branch --list` + `git ls-remote --heads origin` 全列出来,识别本任务创建 / 经手的所有 feature branch 与 worktree(含中途起的 verify/spike/debug 试验分支、被证伪 drop 的分支),**逐个清理干净**,避免一次任务留下多个残留 worktree/branch 堆积。用户 2026-06-05 显式指示。
 
 ```bash
-# 远端 branch:gh pr merge --delete-branch 应该已删, 但 silent failure 模式:
-# **如果 local branch 被 worktree 占用导致 local delete 报错, gh 可能也 skip
-# 了 remote delete** (2026-05-17 #195/#197/#199 实测:3 个 branch 全部 remote
-# 残留). 必须显式 verify + 手动补删:
-git ls-remote --heads origin <branch> | wc -l  # 0 = 已删, >0 = 还在
-# 还在 → 手动删:
-git push origin --delete <branch>
-# 跨多 PR 一次性 cleanup:
-for b in <branch1> <branch2> <branch3>; do
-  git push origin --delete "$b" 2>&1 | tail -1
-done
+# 【顺序,2026-07-08 收严】merge 已不带 --delete-branch(见 step 1 Why),所以此刻远端分支一定
+# 还在,由本步显式删。正确顺序:① 先删 worktree 解锁 branch → ② 删 local branch → ③ 显式删 remote。
+# 反过来(先 branch -D)会因 worktree 锁 branch 而失败;靠 gh 耦合删除会 silent-skip 远端(旧坑根因)。
 
-# 本地 branch:必须先删 worktree 才能删 branch (worktree 锁住 branch)
-git worktree remove "$WORKTREE"   # 没残留改动才允许;有的话先确认或 --force
-git branch -D <branch>            # 删本地 branch(squash merge 后 git 不认 merged)
-git worktree prune                # 清掉 worktree 元数据残留
+# ① 删 worktree —— 它锁住 local branch,不先删则 ② branch -D 失败。
+#    --force:worktree 内有未跟踪 build 产物(dist/target)。即使有正在运行的 app 从此路径跑也无妨:
+#    macOS 允许 unlink 运行中的二进制(进程在内存续跑),rm -rf 不被卡(#590 实测)。
+git -C "$MAIN" worktree remove --force "$WORKTREE"
+git -C "$MAIN" worktree prune                    # 清 worktree 元数据残留
+
+# ② 删 local branch(squash merge 后 git 不认 merged,必须 -D 强删)。
+git -C "$MAIN" branch -D <branch>
+
+# ③ 显式删 remote branch(merge 没带 --delete-branch → 这是唯一删远端处,不再有 silent-skip)。
+git -C "$MAIN" push origin --delete <branch>
+git ls-remote --heads origin <branch> | wc -l    # verify:0 = 已删干净
+
+# 跨多 branch(含中途起的 verify/spike/debug 试验分支)一次清 —— 有 worktree 的先摘 worktree:
+for b in <branch1> <branch2> <branch3>; do
+  wt=$(git -C "$MAIN" worktree list --porcelain | awk -v k="branch refs/heads/$b" '
+    /^worktree /{p=substr($0,10)} $0==k{print p}')
+  [ -n "$wt" ] && git -C "$MAIN" worktree remove --force "$wt"
+  git -C "$MAIN" branch -D "$b" 2>/dev/null
+  git -C "$MAIN" push origin --delete "$b" 2>&1 | tail -1
+done
+git -C "$MAIN" worktree prune
 ```
 
 **⚠️ 必须 verify remote 是否真空**: `git ls-remote --heads origin | awk '{print $2}'`
