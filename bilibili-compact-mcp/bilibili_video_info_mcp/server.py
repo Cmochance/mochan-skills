@@ -2,9 +2,12 @@
 Bilibili视频信息MCP服务器的核心模块
 """
 
+import os
+import tempfile
+
 from mcp.server.fastmcp import FastMCP
 
-from . import bilibili_api
+from . import asr, bilibili_api
 
 # 创建 FastMCP 服务器实例，命名为 BilibiliVideoInfo
 mcp = FastMCP("BilibiliVideoInfo", dependencies=["requests"])
@@ -110,6 +113,63 @@ async def get_subtitles(url: str, page: int = 1, lang: str | None = None) -> dic
         'available_languages': available,
         'lines': result['lines'],
     }
+
+
+@mcp.tool(
+    annotations={
+        "title": "获取视频转录文本",
+        "readOnlyHint": True,
+        "openWorldHint": False
+    }
+)
+async def get_transcript(url: str, page: int = 1, lang: str | None = None,
+                         force_asr: bool = False) -> dict:
+    """Get a spoken-content transcript, preferring CC subtitles and falling back to local ASR.
+
+    对无 CC 字幕的视频,下载音频用本地 ASR 转写(默认 mlx-whisper via uvx,见 asr.py)。
+    WARNING: ASR 路径较慢——需下载音频 + 转写,首次运行还会下载模型,可能耗时数分钟;
+    调用方(MCP client)应容忍长耗时,或先用 get_subtitles 确认是否已有 CC 字幕。
+
+    Args:
+        url: Bilibili video URL, e.g., https://www.bilibili.com/video/BV1x341177NN
+        page: 1-based part number for multi-part (分P) videos, default 1
+        lang: language code; for CC 指定字幕轨,for ASR 指定识别语言(默认中文优先/zh)
+        force_asr: 跳过 CC 字幕直接走音频转写(默认 False)
+
+    Returns:
+        Dict with title, source ('cc' = official subtitle | 'asr' = machine transcription)
+        and lines [{t: seconds, text}]. source='asr' 的文本为语音识别结果,准确度略低于
+        官方字幕,专有名词可能有误。
+    """
+    video_data, cid, error = _resolve_video(url, page)
+    if error:
+        return {"error": error}
+    aid = video_data.get('aid')
+
+    if not force_asr:
+        result, _available, sub_err = bilibili_api.get_subtitles(aid, cid, lang)
+        if result and not sub_err:
+            return {'title': video_data.get('title'), 'page': page,
+                    'source': 'cc', 'lan': result['lan'], 'lines': result['lines']}
+
+    # 无 CC 字幕(或强制):音频 + 本地 ASR
+    audio_url, err = bilibili_api.get_audio_url(aid, cid)
+    if err:
+        return {"error": f"获取音频流失败: {err['error']}"}
+
+    audio_path = tempfile.mktemp(suffix='.m4a', prefix='bili_audio_')
+    try:
+        err = bilibili_api.download_audio(audio_url, audio_path)
+        if err:
+            return {"error": f"下载音频失败: {err['error']}"}
+        lines, err = asr.transcribe(audio_path, language=lang)
+        if err:
+            return {"error": f"音频转写失败: {err['error']}"}
+        return {'title': video_data.get('title'), 'page': page,
+                'source': 'asr', 'lines': lines}
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
 
 @mcp.tool(

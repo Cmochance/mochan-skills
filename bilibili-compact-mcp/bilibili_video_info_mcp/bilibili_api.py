@@ -16,6 +16,7 @@ API_GET_SUBTITLE = "https://api.bilibili.com/x/player/wbi/v2"
 API_GET_DANMAKU_XML = "https://api.bilibili.com/x/v1/dm/list.so"
 API_GET_DANMAKU_SEG = "https://api.bilibili.com/x/v2/dm/web/seg.so"
 API_GET_COMMENTS = "https://api.bilibili.com/x/v2/reply/wbi/main"
+API_GET_PLAYURL = "https://api.bilibili.com/x/player/wbi/playurl"
 
 REQUEST_TIMEOUT = 15
 DANMAKU_SEG_DURATION = 360  # seg.so serves danmaku in 6-minute segments
@@ -287,3 +288,38 @@ def get_comments(aid, limit=20, mode=3):
         return comments_list[:limit] if limit else comments_list, None
     except requests.RequestException as e:
         return [], {'error': f'Failed to get comments: {e}'}
+
+
+def get_audio_url(aid, cid):
+    """Returns the best-bitrate DASH audio stream URL via the WBI-signed playurl.
+
+    yt-dlp 的 B站 提取器过不了 WBI 风控(412),这里用自带 WBI 签名器直接取流。
+    """
+    try:
+        params = wbi.sign({'avid': aid, 'cid': cid, 'qn': 0, 'fnval': 16, 'fourk': 1})
+        response = requests.get(API_GET_PLAYURL, params=params, headers=_get_headers(),
+                                timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('code') != 0:
+            return None, {'error': f"playurl error {data.get('code')}: {data.get('message')}"}
+        audios = (data.get('data', {}).get('dash', {}) or {}).get('audio') or []
+        if not audios:
+            return None, {'error': 'no audio stream in playurl response'}
+        best = max(audios, key=lambda a: a.get('bandwidth', 0))
+        return best['baseUrl'], None
+    except requests.RequestException as e:
+        return None, {'error': f'failed to fetch audio url: {e}'}
+
+
+def download_audio(url, dest_path):
+    """Streams a DASH audio URL to dest_path (referer header defeats 防盗链)."""
+    try:
+        with requests.get(url, headers=_get_headers(), stream=True, timeout=120) as response:
+            response.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+        return None
+    except requests.RequestException as e:
+        return {'error': f'audio download failed: {e}'}
