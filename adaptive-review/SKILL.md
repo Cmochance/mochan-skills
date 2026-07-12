@@ -76,13 +76,21 @@ FILES=$(git diff --name-only HEAD)
 
 **歧义才上 router agent**(默认不上):当 diff 大而杂、信号交叉难定 top-N 时,派 1 个便宜 `general-purpose`(可 `model: haiku`)agent:「给你 diff 的文件清单 + 信号命中表,从 lens 池选最相关的 3-6 个并排序,只回 JSON」。否则纯启发式即定。
 
-## Step 2 — Fan-out(并发 subagent)
+## Step 2 — Fan-out(发现层 → grok,省 Claude 额度)
 
-选中的 lens 并发跑(主线程用多个 Agent 调用,一条消息里并发发出)。每个 agent 必须拿到:**本次改动的文件清单 + `git diff` 摘要 + 该 lens 的聚焦点**,并被告知「只审本次改动,不审 pre-existing 无关代码」。
+**发现层改走 grok CLI**([[tiered-review]] skill,2026-07-12 定案 option A):**不再** spawn pr-review-toolkit / general-purpose finder 子 agent(那烧 Claude 额度)。把 Route 选中的 lens 一次性交给 grok 编排器,用 grok 订阅出结构化 findings:
 
-- **pr-toolkit lens**:`Agent(subagent_type="pr-review-toolkit:silent-failure-hunter", prompt="审查以下未提交改动的 silent failure … 改动文件:<FILES> … git diff:<DIFF 摘要或让它自己 git diff>")`,其余 5 个同理。
-- **codex-angle lens**(`general-purpose`)prompt 模板:
-  > 你是 **<lens>** 审查者。只审这批改动文件:`<FILES>`。聚焦点:<该 lens 的一句话职责,如 removed-behavior=「找被删除的行为:删掉的逻辑是否仍有调用点依赖、是否留下悬空引用、是否静默改变了外部可见行为」>。对每个问题给 `{file, line, severity(BLOCKER/HIGH/MEDIUM/LOW), summary, failure_scenario(具体输入→错误结果), fix}`。没问题就回空数组。**不报 pre-existing 无关问题,不报风格洁癖。**
+```bash
+bash ~/.claude/skills/tiered-review/tiered-review.sh \
+  --dims <Route 选中的 lens 逗号拼,如 correctness-linescan,silent-failure,test-coverage> \
+  --diff <Step 1 的 DIFF 文件>        # 或 --base <ref>;缺省审工作区 git diff
+```
+
+- `--dims` 用 Route 选中的 **lens 名**(= tiered-review `config.lens_prompts` 的 key,含 6 pr-toolkit + 6 codex-angle 全部 lens)。
+- 输出:每 lens 一行 JSON `{lens, backend:"grok", findings:[{file,line,severity,summary,failure_scenario}]}`;grok 用 `--json-schema` 约束结构化,可靠可解析。
+- **`error` 的 lens** 在报告里**显式说明**「grok 该维度未审(原因)」,**不当作无问题**。
+- **前提**:grok 已 `grok login`(auth `~/.grok/auth.json`)。未装/未登录 → tiered-review.sh 对该 lens 回 error;此时回退老路(spawn subagent)或提示用户登录。
+- PreToolUse hook `tiered-review/hooks/route-review.py` 会 deny 直接 spawn 的 `pr-review-toolkit:*` 子 agent 作兜底守门(防漏走成 Claude 额度)。**验证/综合仍用 Claude(见 Step 3/4),别在那里 spawn pr-review-toolkit(会被再 deny)。**
 
 ## Step 3 — Verify(standard/thorough 带;quick 不带)
 

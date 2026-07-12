@@ -1,0 +1,26 @@
+{
+  "_comment": "tiered-review 实例配置模板。复制为 config.local.json 使用(config.local.json 已 gitignore)。无秘密值,主要是模型选择 + 各 lens 的审查 prompt。",
+  "backends": {
+    "grok": {
+      "model": "grok-4.5",
+      "extra_flags": ["--disable-web-search", "--always-approve"]
+    }
+  },
+  "common_preamble": "你是严谨的代码审查员。**只审查下面 `=== DIFF ===` 里的改动**,针对性找真问题;忽略 diff 之外的泛泛建议。每条 finding 必须能落到 file:line,并给出**具体触发场景**(什么输入/状态 → 什么错误后果/崩溃),不能是「建议考虑」这种空话。没有真问题就返回空数组 []。宁缺毋滥,不确定的标 low。按给定 JSON schema 输出 findings 数组。",
+  "_lens_key_note": "key = adaptive-review 的 lens 名(单一命名空间)。hook 从 pr-review-toolkit:<agent> 抽 agent 名后经 AGENT_TO_LENS 映射成这里的 lens 名再传 --dims。",
+  "lens_prompts": {
+    "correctness-linescan": "维度=正确性(pr-review-toolkit:code-reviewer):找逻辑错误、边界/off-by-one、空值/panic、并发/资源、错误的假设、与周边代码约定的偏离。",
+    "silent-failure": "维度=静默失败(silent-failure-hunter):找被吞掉的错误、不当 fallback —— 空 catch/except 吞异常、unwrap_or/.ok()/?  掩盖真错、|| default 降级、错误被转成占位符/空返回而用户看不到。区分「预期静默(如资源没就绪跳过)」与「真错被藏」,只报后者。",
+    "test-coverage": "维度=测试覆盖(pr-test-analyzer):新增/改动的逻辑有无对应测试;列**最高价值的缺失测试**(会静默回归、不测就发现不了的);指出断言错误/同义反复(tautological)的测试。",
+    "comment-accuracy": "维度=注释准确性(comment-analyzer):diff 里注释/文档与代码实际是否漂移 —— 注释声称的行为/协议/wire/字段/版本/端点与代码是否一致;会误导未来维护者重新引入 bug 的过时注释。",
+    "type-design": "维度=类型设计(type-design-analyzer):评审 diff **新增**的类型 —— 封装(调用方能否破坏不变量)、不变量是否用类型表达、该用枚举/结构却用了裸元组/开放 string、并存字段能否不一致。只看新类型。",
+    "simplification": "维度=可简化(code-simplifier,**保持行为不变**):重复/镜像逻辑可抽公用模块、冗长控制流、可复用现有模块而非新造。**禁**任何可能改变功能的建议。",
+    "removed-behavior": "维度=删除的行为:diff 里被删掉的逻辑是否仍有调用点依赖、是否留下悬空引用、是否静默改变了外部可见行为(功能、返回、副作用)。",
+    "cross-file-impact": "维度=跨文件影响:改了函数/方法签名、pub/导出接口、公共类型 → 是否所有调用点同步更新、是否破坏下游、是否漏改某处。",
+    "language-pitfall": "维度=语言陷阱:Rust `.unwrap()`/`.expect()`/`as` 截断/`mem::`;TS `any`/`==`/`!` 非空断言;Go 忽略 `err`;等语言特有危险用法。",
+    "wrapper-proxy": "维度=转发层:新增 wrapper/proxy/adapter/middleware 是否漏传/改写/丢失 header/body/error/超时/取消/重试语义。",
+    "dependency": "维度=依赖变更:Cargo.toml/package.json/*.lock 改动 —— 新依赖必要性、版本/供应链风险、是否引入重复或冲突。",
+    "concurrency": "维度=并发:async/await/Mutex/RwLock/Arc/spawn/Ordering —— 死锁、跨 await 持锁、竞态、原子序错误、取消/panic 安全。",
+    "default": "维度=通用:审查正确性、错误处理、可维护性问题。"
+  }
+}

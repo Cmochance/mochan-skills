@@ -1,0 +1,17 @@
+{
+  "type": "array",
+  "description": "代码审查发现的问题列表;没有问题则空数组 []。只针对给定 diff 的改动。",
+  "items": {
+    "type": "object",
+    "required": ["file", "severity", "summary", "failure_scenario"],
+    "additionalProperties": false,
+    "properties": {
+      "file": { "type": "string", "description": "仓库相对路径" },
+      "line": { "type": "integer", "description": "1-indexed 行号(diff 内)" },
+      "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+      "category": { "type": "string", "description": "kebab-case 类别 slug,如 correctness/silent-failure/test-coverage" },
+      "summary": { "type": "string", "description": "一句话说清缺陷" },
+      "failure_scenario": { "type": "string", "description": "具体触发输入/状态 → 错误输出/崩溃" }
+    }
+  }
+}
