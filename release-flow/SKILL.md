@@ -1,6 +1,6 @@
 ---
 name: release-flow
-description: 发版/release 全流程 SOP:dispatch 前预发布微 PR(版本号全盘 grep bump、双语 release notes 硬模板 2500-3200 字符、release-notes/vX.Y.Z.md CI 门禁)、release.yml workflow_dispatch 版本校验、merge cleanup 顺序、build 完保持 draft 等用户显式确认才转 Latest。用户说「发版/准备 release/触发 release workflow」时使用。
+description: 发版/release 全流程 SOP:dispatch 前预发布微 PR(版本号全盘 grep bump、双语 release notes 硬模板 2500-3200 字符、documents/release-notes/vX.Y.Z.md CI 门禁)、release.yml workflow_dispatch 版本校验、merge cleanup 顺序、build 完保持 draft 等用户显式确认才转 Latest。用户说「发版/准备 release/触发 release workflow」时使用。
 ---
 
 # Release 发版 SOP
@@ -55,8 +55,8 @@ rg -l "\b$OLD\b" --type-not lock | head -20
 
 可能要改(grep 后判断):
 - `README.md` / `README.en.md` stability rollups / version table(若有提及当前版本)
-- `CHANGELOG.md` 若存在
-- `ACKNOWLEDGEMENTS.md` 不动(借鉴清单与版本号无关)
+- `documents/CHANGELOG.md` 若存在
+- `documents/ACKNOWLEDGEMENTS.md` 不动(借鉴清单与版本号无关)
 - 任何含上版本号的 docs(本项目 `docs/` gitignored,跳)
 
 ### B. 撰写 release notes(写到 PR body)
@@ -81,13 +81,13 @@ gh pr view <N> --json body -q .body \
 gh release edit vX.Y.Z --notes-file /tmp/release-notes.md
 ```
 
-### C. notes 文件 commit 进 `release-notes/vX.Y.Z.md`(MOC-66 CI 门禁,2026-06-13 起强制)
+### C. notes 文件 commit 进 `documents/release-notes/vX.Y.Z.md`(MOC-66 CI 门禁,2026-06-13 起强制;2026-07-25 PR #611 起路径在 documents/ 下)
 
-notes 除了写 PR body,**同一个微 PR 必须把同样内容落成 `release-notes/vX.Y.Z.md` commit 进仓库**(格式 = GitHub body 原文,LF、单尾换行,与既有文件一致)。`release.yml` 两个 job 各有一步 `Verify release notes present`(`scripts/check_release_notes_present.py`)校验该文件存在且非空,**缺失 = 4 平台 build 全 fail**;push tag 触发 checkout 的是 tag commit,文件必须在打 tag 前进仓库。
+notes 除了写 PR body,**同一个微 PR 必须把同样内容落成 `documents/release-notes/vX.Y.Z.md` commit 进仓库**(格式 = GitHub body 原文,LF、单尾换行,与既有文件一致)。`release.yml` 两个 job 各有一步 `Verify release notes present`(`scripts/check_release_notes_present.py`)校验该文件存在且非空,**缺失 = 4 平台 build 全 fail**;push tag 触发 checkout 的是 tag commit,文件必须在打 tag 前进仓库。
 
 有了仓库文件,merge 后注入可直接用它(替代从 PR body 提取):
 ```bash
-gh release edit vX.Y.Z --notes-file release-notes/vX.Y.Z.md
+gh release edit vX.Y.Z --notes-file documents/release-notes/vX.Y.Z.md
 ```
 
 **Why**:只写 PR body 不 commit 文件的旧 SOP 让 MOC-65 回填后又复发 —— v2.2.0 / v2.2.1 / v2.3.0 / v2.3.1 四版「GitHub body 有、仓库缺」,2026-06-13 MOC-66 实施门禁时一并回填。
@@ -229,7 +229,7 @@ Changes in this release:
 - 写完先跑上述 4 条 grep / wc 校验,任一不通过立刻精简
 - 多修复点时先写 1 段综合主题引言,再写 5 条 bullets 各占一行(每条 80-120 字符),不要拆 2 个 `###`
 - 引言段总长控制在 ~600 字符(中英各 ~300),bullets 总 ~800 字符(中英各 ~400),验证段 ~300(中英各 ~150),合计 ~1700-2000 raw,留余量到 3200 上限
-- 详细变更归 `docs/CHANGELOG.md` 或 `docs/release-notes/v*.md`(项目内),release notes 只放本版核心修复
+- 详细变更归 `documents/CHANGELOG.md`(2026-07-25 前为根目录/docs 时代路径),release notes 只放本版核心修复
 - 已发的历史 release notes(v2.0.x / v2.1.0 ~ v2.1.5)**不回头改**,只对 v2.1.6+ 及之后生效(v2.1.6 在 2026-05-13 已按本模板回写)
 
 **Release workflow 等待期自动起草 + 落地即写入(2026-05-16 新增)**:
