@@ -1,8 +1,13 @@
 agy-cli-modify — Attribution & License Notice
 
-Design inspiration:
-- oil-oil/agy-fast-io (https://github.com/oil-oil/agy-fast-io), licensed under the MIT License (Copyright (c) oil-oil).
-
-Relationship to upstream:
-- Adapted conceptually from `agy-fast-io`'s turn-reduction workflow ideas (locate line numbers first, asymmetric context slicing, concise responses), rewritten from scratch specifically for Antigravity CLI (`agy`) on macOS (`zsh` + local sandbox + Plan/Execute dual-phase architecture).
-- Stripped upstream's Antigravity Desktop cloud-review static whitelist constraints (which forbade `rg`, `find`, `jq`, and pipes).
+Design inspirations (all rules and scripts in this plugin are written from scratch for Antigravity CLI):
+- oil-oil/agy-fast-io (https://github.com/oil-oil/agy-fast-io), MIT License:
+  turn-reduction workflow ideas (locate line numbers first, asymmetric context slicing, concise responses).
+- INK-Q/agy-fast (https://github.com/INK-Q/agy-fast):
+  `SessionStart` workspace snapshot concept and symbol-outline-before-slicing workflow.
+- rtk-ai/rtk (https://github.com/rtk-ai/rtk):
+  quiet-on-success build/test output hygiene to prevent context bloat.
+- JuliusBrussee/caveman (https://github.com/JuliusBrussee/caveman):
+  suppressing mid-turn narration between tool calls.
+- antigravity-token-optimizations:
+  context-window hygiene and offloading broad read-only exploration to subagents.

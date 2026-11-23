@@ -1,0 +1,11 @@
+{
+  "workspace-snapshot": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/session-start.sh",
+        "timeout": 3
+      }
+    ]
+  }
+}
