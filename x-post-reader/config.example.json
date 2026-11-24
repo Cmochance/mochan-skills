@@ -1,0 +1,31 @@
+{
+  "proxy": null,
+  "cache_dir": "~/.cache/x-post-reader/cache",
+  "output_spill_dir": "~/.cache/x-post-reader/out",
+  "state_dir": "~/.cache/x-post-reader/state",
+  "cache_ttl_seconds": 3600,
+  "inline_max_chars": 16000,
+  "tier1": {
+    "api_base": "https://api.fxtwitter.com",
+    "max_upstream_walk": 20,
+    "timeout_seconds": 10
+  },
+  "tier2": {
+    "enabled": true,
+    "jina_base": "https://r.jina.ai",
+    "jina_timeout_seconds": 30,
+    "jina_api_key": ""
+  },
+  "tier3": {
+    "enabled": true,
+    "twitter_bin": "~/.local/bin/twitter",
+    "cookie_source": "config_file",
+    "auth_token": "",
+    "ct0": "",
+    "browser_name": "",
+    "max_thread_tweets": 50,
+    "min_interval_seconds": 2.5,
+    "circuit_breaker_cooldown_seconds": 900,
+    "timeout_seconds": 50
+  }
+}

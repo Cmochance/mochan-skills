@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""x-read: Three-tier X (Twitter) full-text, X Article, and self-thread reader."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Dict, List, Optional
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_DIR = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from formatter import (
+    find_same_author_subroot,
+    reconstruct_self_thread,
+    render_json_payload,
+    render_markdown,
+)
+from tiers import (
+    ArticleData,
+    PostItem,
+    TargetSpec,
+    TierError,
+    atomic_write_private,
+    cfg_int,
+    check_tier3_readiness,
+    fetch_tier1_fxembed,
+    fetch_tier2_jina,
+    fetch_tier3_article,
+    fetch_tier3_thread,
+    is_likely_thread_head,
+    parse_x_target,
+    verify_tier3_auth,
+    walk_upstream_tier1,
+)
+
+
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "proxy": None,
+    "cache_dir": "~/.cache/x-post-reader/cache",
+    "output_spill_dir": "~/.cache/x-post-reader/out",
+    "state_dir": "~/.cache/x-post-reader/state",
+    "cache_ttl_seconds": 3600,
+    "inline_max_chars": 16000,
+    "tier1": {
+        "api_base": "https://api.fxtwitter.com",
+        "max_upstream_walk": 20,
+        "timeout_seconds": 10,
+    },
+    "tier2": {
+        "enabled": True,
+        "jina_base": "https://r.jina.ai",
+        "jina_timeout_seconds": 30,
+        "jina_api_key": "",
+    },
+    "tier3": {
+        "enabled": True,
+        "twitter_bin": "~/.local/bin/twitter",
+        "cookie_source": "config_file",
+        "auth_token": "",
+        "ct0": "",
+        "browser_name": "",
+        "max_thread_tweets": 50,
+        "min_interval_seconds": 2.5,
+        "circuit_breaker_cooldown_seconds": 900,
+        "timeout_seconds": 50,
+    },
+}
+
+
+class ConfigError(RuntimeError):
+    """Raised when configuration file cannot be read or parsed."""
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = copy.deepcopy(v)
+    return merged
+
+
+def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load config.local.json (falling back to config.example.json and defaults)."""
+    cfg = copy.deepcopy(_DEFAULT_CONFIG)
+    if config_path is not None:
+        resolved = Path(os.path.expanduser(str(config_path)))
+        if not resolved.exists():
+            raise ConfigError(f"Config file not found: {resolved}")
+        try:
+            loaded = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"Invalid config JSON in {resolved}: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"Config root must be a JSON object in {resolved}")
+        return _deep_merge(cfg, loaded)
+
+    for candidate in (SKILL_DIR / "config.local.json", SKILL_DIR / "config.example.json"):
+        if candidate.exists():
+            try:
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ConfigError(f"Invalid config JSON in {candidate}: {exc}") from exc
+            if not isinstance(loaded, dict):
+                raise ConfigError(f"Config root must be a JSON object in {candidate}")
+            return _deep_merge(cfg, loaded)
+    return cfg
+
+
+def _cache_file_path(
+    config: Dict[str, Any],
+    target: TargetSpec,
+    mode: str,
+    forced_tier: str,
+    include_replies: int,
+    output_format: str,
+) -> Path:
+    cache_dir = Path(os.path.expanduser(str(config.get("cache_dir") or "~/.cache/x-post-reader/cache")))
+    key = hashlib.sha256(
+        f"{target.tweet_id}:{int(target.is_article_url)}:{mode}:{forced_tier}:{include_replies}:{output_format}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return cache_dir / f"{target.tweet_id}_{key}.json"
+
+
+def _read_cache(path: Path, ttl: int) -> Optional[str]:
+    if ttl <= 0 or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        if time.time() - float(raw.get("ts") or 0) <= ttl:
+            rendered = raw.get("rendered")
+            return str(rendered) if isinstance(rendered, str) and rendered else None
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _write_cache(path: Path, rendered: str) -> None:
+    try:
+        atomic_write_private(path, json.dumps({"ts": time.time(), "rendered": rendered}, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+def _best_effort_extra_replies(
+    tweet_id: str,
+    focal: PostItem,
+    config: Dict[str, Any],
+    include_replies: int,
+) -> List[PostItem]:
+    if include_replies <= 0:
+        return []
+    ready, _ = check_tier3_readiness(config)
+    if not ready:
+        return []
+    try:
+        t3_posts = fetch_tier3_thread(tweet_id, config)
+    except TierError:
+        return []
+    _, extra, _ = reconstruct_self_thread(focal, [], t3_posts, include_replies=include_replies)
+    return extra
+
+
+def _handle_article_flow(
+    target: TargetSpec,
+    focal: Optional[PostItem],
+    had_tier1: bool,
+    tier1_error: Optional[TierError],
+    config: Dict[str, Any],
+    forced_tier: str,
+    include_replies: int,
+) -> Dict[str, Any]:
+    """Resolve X Article content across Tier 1 blocks, Tier 2 Jina, and Tier 3 twitter-cli."""
+    if forced_tier == "1" and not had_tier1:
+        raise tier1_error or TierError("tier1_failed", f"Tier 1 unavailable for {target.tweet_id}")
+
+    if focal is None:
+        focal = PostItem(
+            id=target.tweet_id,
+            url=target.canonical_url,
+            author_id="",
+            author_handle=target.user_hint,
+            author_name=target.user_hint,
+            created_at="",
+            text="",
+            article=ArticleData(title="", has_complex_blocks=True),
+        )
+
+    article = focal.article or ArticleData(title="", has_complex_blocks=True)
+    baseline_len = max(
+        int(len(article.blocks_markdown) * 0.7),
+        int(len(article.preview_text) * 0.7),
+        40,
+    )
+
+    if forced_tier == "1":
+        comp = "full" if (article.blocks_markdown and not article.has_complex_blocks) else "partial_root_only"
+        note = "" if comp == "full" else "Tier 1 returned article preview/blocks only; run without --tier 1 for full rendering."
+        return {
+            "focal": focal,
+            "posts": [focal],
+            "post_type": "article",
+            "tier_used": "tier1:fxembed",
+            "completeness": comp,
+            "completeness_note": note,
+            "article_markdown": article.blocks_markdown or article.preview_text or focal.text,
+            "article_title": article.title,
+            "extra_replies": [],
+        }
+
+    # Fast path: clean text-only X Article already parsed completely by Tier 1
+    if forced_tier == "auto" and had_tier1 and article.blocks_markdown and not article.has_complex_blocks:
+        extra = _best_effort_extra_replies(target.tweet_id, focal, config, include_replies)
+        return {
+            "focal": focal,
+            "posts": [focal],
+            "post_type": "article",
+            "tier_used": "tier1:fxembed",
+            "completeness": "full",
+            "completeness_note": "",
+            "article_markdown": article.blocks_markdown,
+            "article_title": article.title,
+            "extra_replies": extra,
+        }
+
+    # Tier 2: Jina Reader (for complex articles or /article/<id> URLs)
+    tier2_err = ""
+    if forced_tier in {"auto", "2"}:
+        try:
+            jina_md = fetch_tier2_jina(focal.url or target.canonical_url, config, baseline_min_len=baseline_len)
+            extra = (
+                _best_effort_extra_replies(target.tweet_id, focal, config, include_replies)
+                if forced_tier == "auto"
+                else []
+            )
+            return {
+                "focal": focal,
+                "posts": [focal],
+                "post_type": "article",
+                "tier_used": "tier2:jina",
+                "completeness": "full",
+                "completeness_note": "",
+                "article_markdown": jina_md,
+                "article_title": article.title,
+                "extra_replies": extra,
+            }
+        except TierError as exc:
+            tier2_err = str(exc)
+            if forced_tier == "2":
+                raise
+
+    # Tier 3: twitter-cli native `twitter article`
+    if forced_tier in {"auto", "3"}:
+        ready, reason = check_tier3_readiness(config)
+        if ready:
+            try:
+                t3_post = fetch_tier3_article(target.tweet_id, config)
+                t3_article = t3_post.article or ArticleData(title="")
+                if not t3_article.blocks_markdown:
+                    if forced_tier == "3":
+                        raise TierError("tier3_no_article", f"Post {target.tweet_id} has no X Article content")
+                else:
+                    chosen_focal = (
+                        t3_post if (not had_tier1 or focal.author_handle in {"i", "unknown", ""}) else focal
+                    )
+                    complex_omitted = had_tier1 and article.has_complex_blocks
+                    comp = "partial_root_only" if complex_omitted else "full"
+                    note = (
+                        f"Tier 2 failed ({tier2_err}); Tier 3 twitter-cli omits embedded atomic media/code cards."
+                        if complex_omitted
+                        else ""
+                    )
+                    extra = _best_effort_extra_replies(target.tweet_id, chosen_focal, config, include_replies)
+                    return {
+                        "focal": chosen_focal,
+                        "posts": [t3_post],
+                        "post_type": "article",
+                        "tier_used": "tier3:twitter-cli",
+                        "completeness": comp,
+                        "completeness_note": note,
+                        "article_markdown": t3_article.blocks_markdown,
+                        "article_title": t3_article.title or article.title,
+                        "extra_replies": extra,
+                    }
+            except TierError as exc:
+                tier2_err = f"{tier2_err}; tier3={exc}".strip("; ")
+                if forced_tier == "3":
+                    raise
+        elif forced_tier == "3":
+            raise TierError("tier3_unavailable", reason)
+        else:
+            tier2_err = f"{tier2_err}; tier3_skipped={reason}".strip("; ")
+
+    # Graceful partial degradation ONLY when Tier 1 actually fetched non-empty article payload
+    fallback_body = (article.blocks_markdown or article.preview_text or focal.text).strip()
+    if not had_tier1 or not fallback_body:
+        combined_err = "; ".join(part for part in (str(tier1_error) if tier1_error else "", tier2_err) if part)
+        raise TierError("all_tiers_failed", combined_err or f"Failed to extract X Article {target.tweet_id}")
+
+    comp = "full" if (article.blocks_markdown and not article.has_complex_blocks) else "partial_root_only"
+    return {
+        "focal": focal,
+        "posts": [focal],
+        "post_type": "article",
+        "tier_used": "tier1:fxembed",
+        "completeness": comp,
+        "completeness_note": (
+            f"Full rich-text render unavailable ({tier2_err}). Returned Tier 1 article payload."
+            if comp != "full" and tier2_err
+            else ""
+        ),
+        "article_markdown": fallback_body,
+        "article_title": article.title,
+        "extra_replies": [],
+    }
+
+
+def _handle_thread_flow(
+    target: TargetSpec,
+    focal: Optional[PostItem],
+    tier1_error: Optional[TierError],
+    config: Dict[str, Any],
+    forced_tier: str,
+    include_replies: int,
+    trigger_reason: str,
+) -> Dict[str, Any]:
+    """Resolve upstream parents (Tier 1) + downstream self-thread (Tier 3) with safe degradation."""
+    if forced_tier == "2":
+        raise TierError(
+            "unsupported_tier_for_mode",
+            "Tier 2 (Jina Reader) does not support multi-post thread reconstruction",
+        )
+
+    upstream: List[PostItem] = []
+    hit_upstream_limit = False
+    if focal is not None and forced_tier in {"auto", "1"}:
+        upstream, hit_upstream_limit = walk_upstream_tier1(focal, config)
+
+    if forced_tier == "1":
+        if focal is None:
+            raise tier1_error or TierError("tier1_failed", f"Tier 1 returned no post data for {target.tweet_id}")
+        posts = upstream if upstream else [focal]
+        comp = "partial_upstream_only" if len(posts) > 1 or bool(focal.replying_to_status) else "partial_root_only"
+        return {
+            "focal": focal,
+            "posts": posts,
+            "post_type": "thread",
+            "tier_used": "tier1:fxembed",
+            "completeness": comp,
+            "completeness_note": "Forced --tier 1: downstream author replies were not fetched.",
+            "extra_replies": [],
+        }
+
+    sub_root = find_same_author_subroot(focal, upstream)[1][0] if (focal is not None and upstream) else focal
+    query_root_id = sub_root.id if sub_root else target.tweet_id
+    ready, reason = check_tier3_readiness(config)
+    tier3_err = ""
+
+    if ready and forced_tier in {"auto", "3"}:
+        try:
+            t3_posts = fetch_tier3_thread(query_root_id, config)
+            seen_ids = {p.id for p in t3_posts if p.id}
+            if focal and focal.id != query_root_id and focal.id not in seen_ids:
+                try:
+                    for extra_item in fetch_tier3_thread(focal.id, config):
+                        if extra_item.id not in seen_ids:
+                            seen_ids.add(extra_item.id)
+                            t3_posts.append(extra_item)
+                except TierError:
+                    pass
+
+            base_focal = focal or next((p for p in t3_posts if p.id == target.tweet_id), t3_posts[0])
+
+            def _verify_parent(candidate: PostItem) -> Optional[PostItem]:
+                try:
+                    return fetch_tier1_fxembed(
+                        TargetSpec(
+                            tweet_id=candidate.id,
+                            user_hint=candidate.author_handle or "i",
+                            is_article_url=False,
+                            canonical_url=candidate.url or f"https://x.com/i/status/{candidate.id}",
+                        ),
+                        config,
+                    )
+                except TierError:
+                    return None
+
+            def _walk_ancestors(candidate: PostItem):
+                return walk_upstream_tier1(candidate, config)
+
+            thread_posts, extra_replies, verify_incomplete = reconstruct_self_thread(
+                base_focal,
+                upstream,
+                t3_posts,
+                include_replies=include_replies,
+                verify_parent_fn=_verify_parent if forced_tier != "3" else None,
+                walk_ancestors_fn=_walk_ancestors if forced_tier != "3" else None,
+            )
+
+            notes: List[str] = []
+            if hit_upstream_limit:
+                comp = "partial_upstream_only"
+                notes.append("Upstream parent chain hit max_upstream_walk or encountered an unreachable ancestor.")
+            elif verify_incomplete:
+                comp = "partial_root_only"
+                notes.append("Some candidate author replies could not be parent-verified via Tier 1 and were omitted.")
+            else:
+                comp = "full"
+
+            return {
+                "focal": base_focal,
+                "posts": thread_posts,
+                "post_type": "thread" if len(thread_posts) > 1 else ("note_tweet" if base_focal.is_note_tweet else "single"),
+                "tier_used": "tier3:twitter-cli",
+                "completeness": comp,
+                "completeness_note": " ".join(notes),
+                "extra_replies": extra_replies,
+            }
+        except TierError as exc:
+            tier3_err = str(exc)
+            if forced_tier == "3":
+                raise
+    elif forced_tier == "3":
+        raise TierError("tier3_unavailable", reason)
+    else:
+        tier3_err = reason
+
+    # Graceful degradation without Tier 3
+    if focal is None:
+        combined = "; ".join(part for part in (str(tier1_error) if tier1_error else "", tier3_err) if part)
+        raise TierError("all_tiers_failed", combined or f"Tier 1 unavailable and Tier 3 failed ({tier3_err})")
+
+    posts = upstream if upstream else [focal]
+    if focal.replying_to_status:
+        comp = "partial_upstream_only"
+        note = (
+            f"Fetched upstream chain via Tier 1 ({len(posts)} posts), but downstream replies require Tier 3 ({tier3_err})."
+        )
+    else:
+        comp = "partial_root_only"
+        note = (
+            f"Detected likely thread head ({trigger_reason}), but only the root post was fetched because Tier 3 is unavailable ({tier3_err})."
+        )
+
+    return {
+        "focal": focal,
+        "posts": posts,
+        "post_type": "thread",
+        "tier_used": "tier1:fxembed",
+        "completeness": comp,
+        "completeness_note": note,
+        "extra_replies": [],
+    }
+
+
+def _handle_single_flow(
+    target: TargetSpec,
+    focal: Optional[PostItem],
+    tier1_error: Optional[TierError],
+    config: Dict[str, Any],
+    forced_tier: str,
+    include_replies: int,
+) -> Dict[str, Any]:
+    """Resolve a single post or note_tweet without turning it into a thread."""
+    if focal is not None and forced_tier in {"auto", "1"}:
+        ptype = "note_tweet" if focal.is_note_tweet else "single"
+        extra = (
+            _best_effort_extra_replies(target.tweet_id, focal, config, include_replies)
+            if forced_tier == "auto"
+            else []
+        )
+        return {
+            "focal": focal,
+            "posts": [focal],
+            "post_type": ptype,
+            "tier_used": "tier1:fxembed",
+            "completeness": "full",
+            "completeness_note": "",
+            "extra_replies": extra,
+        }
+
+    tier2_err = ""
+    if forced_tier in {"auto", "2"} and not (tier1_error and tier1_error.code == "not_found"):
+        try:
+            md = fetch_tier2_jina(target.canonical_url, config)
+            stub = focal or PostItem(
+                id=target.tweet_id,
+                url=target.canonical_url,
+                author_id="",
+                author_handle=target.user_hint,
+                author_name=target.user_hint,
+                created_at="",
+                text=md,
+            )
+            stub.text = md
+            extra = (
+                _best_effort_extra_replies(target.tweet_id, stub, config, include_replies)
+                if forced_tier == "auto"
+                else []
+            )
+            return {
+                "focal": stub,
+                "posts": [stub],
+                "post_type": "single",
+                "tier_used": "tier2:jina",
+                "completeness": "full",
+                "completeness_note": "",
+                "extra_replies": extra,
+            }
+        except TierError as exc:
+            tier2_err = str(exc)
+            if forced_tier == "2":
+                raise
+
+    if forced_tier in {"auto", "3"}:
+        ready, reason = check_tier3_readiness(config)
+        if ready:
+            try:
+                t3_posts = fetch_tier3_thread(target.tweet_id, config)
+                single_post = next((p for p in t3_posts if p.id == target.tweet_id), t3_posts[0])
+                _, extra, _ = reconstruct_self_thread(
+                    single_post, [], t3_posts, include_replies=include_replies
+                )
+                return {
+                    "focal": single_post,
+                    "posts": [single_post],
+                    "post_type": "note_tweet" if single_post.is_note_tweet else "single",
+                    "tier_used": "tier3:twitter-cli",
+                    "completeness": "full",
+                    "completeness_note": "",
+                    "extra_replies": extra,
+                }
+            except TierError as exc:
+                if forced_tier == "3":
+                    raise
+                combined = "; ".join(
+                    p for p in (str(tier1_error) if tier1_error else "", tier2_err, f"tier3={exc}") if p
+                )
+                raise TierError("all_tiers_failed", combined) from exc
+        elif forced_tier == "3":
+            raise TierError("tier3_unavailable", reason)
+        else:
+            if tier1_error and tier1_error.code == "not_found" and not tier2_err:
+                raise tier1_error
+            combined = "; ".join(
+                p for p in (str(tier1_error) if tier1_error else "", tier2_err, f"tier3_skipped={reason}") if p
+            )
+            raise TierError("all_tiers_failed", combined)
+
+    raise tier1_error or TierError("tier1_failed", f"Failed to fetch post {target.tweet_id}")
+
+
+def resolve_post(
+    raw_target: str,
+    *,
+    config: Dict[str, Any],
+    mode: str = "auto",
+    forced_tier: str = "auto",
+    include_replies: int = 0,
+) -> Dict[str, Any]:
+    """Route an X URL/ID across Tier 1 -> Tier 2 -> Tier 3 based on detected post type."""
+    target = parse_x_target(raw_target)
+
+    if mode == "thread" and forced_tier == "2":
+        raise TierError(
+            "unsupported_tier_for_mode",
+            "Tier 2 (Jina Reader) does not support multi-post thread reconstruction",
+        )
+
+    focal: Optional[PostItem] = None
+    tier1_error: Optional[TierError] = None
+    had_tier1 = False
+
+    if forced_tier in {"auto", "1"} and not (mode == "article" and forced_tier == "2"):
+        try:
+            focal = fetch_tier1_fxembed(target, config)
+            had_tier1 = True
+        except TierError as exc:
+            tier1_error = exc
+            if forced_tier == "1":
+                raise
+            if exc.code == "not_found" and not (target.is_article_url or mode == "article"):
+                # Allow protected/age-gated fallback ONLY if Tier 3 is ready
+                if not check_tier3_readiness(config)[0]:
+                    raise
+
+    # Determine effective mode
+    effective_mode = mode
+    thread_reason = "explicit_thread_flag" if mode == "thread" else ""
+    if effective_mode == "auto":
+        if target.is_article_url or (focal and focal.article is not None):
+            effective_mode = "article"
+        elif focal is None:
+            effective_mode = "thread" if forced_tier == "3" else "single"
+            if effective_mode == "thread":
+                thread_reason = "forced_tier3"
+        elif focal.replying_to_status:
+            effective_mode = "thread"
+            thread_reason = "replying_to_status_present"
+        else:
+            likely, reason = is_likely_thread_head(focal)
+            if likely:
+                effective_mode = "thread"
+                thread_reason = reason
+            else:
+                effective_mode = "single"
+
+    if effective_mode == "article":
+        return _handle_article_flow(
+            target, focal, had_tier1, tier1_error, config, forced_tier, include_replies
+        )
+
+    if effective_mode == "thread":
+        return _handle_thread_flow(
+            target, focal, tier1_error, config, forced_tier, include_replies, thread_reason or "thread"
+        )
+
+    return _handle_single_flow(target, focal, tier1_error, config, forced_tier, include_replies)
+
+
+def apply_spill_guard(rendered: str, tweet_id: str, config: Dict[str, Any], ext: str) -> str:
+    """Spill oversized outputs to disk and emit front-matter + preview + file path."""
+    max_chars = cfg_int(config, "inline_max_chars", 16000)
+    if max_chars <= 0 or len(rendered) <= max_chars:
+        return rendered
+
+    spill_dir = Path(os.path.expanduser(str(config.get("output_spill_dir") or "~/.cache/x-post-reader/out")))
+    out_path = spill_dir / f"{tweet_id}.{ext}"
+    atomic_write_private(out_path, rendered)
+
+    if ext == "json":
+        return json.dumps(
+            {
+                "truncated": True,
+                "total_chars": len(rendered),
+                "saved_to": str(out_path),
+                "preview": rendered[:800],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    header = ""
+    body = rendered
+    if rendered.startswith("---\n"):
+        end_idx = rendered.find("\n---\n", 4)
+        if end_idx != -1:
+            header = rendered[: end_idx + 5]
+            body = rendered[end_idx + 5 :].lstrip()
+
+    preview = body[:800].rstrip()
+    return (
+        f"{header}\n"
+        f"> [!NOTE] Output exceeded {max_chars} chars ({len(rendered)} chars). "
+        f"Full content saved to `{out_path}` — inspect with `read_file`.\n\n"
+        f"{preview}\n...\n"
+    )
+
+
+def _mask_handle(handle: str) -> str:
+    clean = (handle or "").lstrip("@").strip()
+    if not clean:
+        return "***"
+    if len(clean) <= 2:
+        return clean[0] + "*"
+    if len(clean) <= 4:
+        return clean[0] + ("*" * (len(clean) - 2)) + clean[-1]
+    return clean[:2] + ("*" * (len(clean) - 4)) + clean[-2:]
+
+
+def run_doctor(config: Dict[str, Any], config_err: str = "") -> int:
+    """Check health of local config, Tier 1, Tier 2, and live Tier 3 authentication."""
+    local_cfg = SKILL_DIR / "config.local.json"
+    print(f"Skill dir: {SKILL_DIR}")
+    rc = 0
+
+    if config_err:
+        print(f"[FAIL] Config error: {config_err}")
+        return 1
+
+    if local_cfg.exists():
+        mode_bits = local_cfg.stat().st_mode & 0o777
+        if mode_bits & 0o077:
+            print(f"[WARN] config.local.json permissions too open ({oct(mode_bits)}); run chmod 600 {local_cfg}")
+        else:
+            print(f"[OK] config.local.json present (mode={oct(mode_bits)})")
+    else:
+        print("[WARN] config.local.json missing (using config.example.json defaults)")
+
+    # Tier 1 probe
+    try:
+        sample = fetch_tier1_fxembed(parse_x_target("https://x.com/jack/status/20"), config)
+        print(f"[OK] Tier 1 (FxEmbed): reachable (sample=@{sample.author_handle}: {sample.text!r})")
+    except TierError as exc:
+        print(f"[FAIL] Tier 1 (FxEmbed): {exc}")
+
+    # Tier 2 config check
+    t2 = config.get("tier2") or {}
+    if t2.get("enabled", True):
+        print(f"[OK] Tier 2 (Jina Reader): enabled=True, base={t2.get('jina_base')}")
+    else:
+        print("[INFO] Tier 2 (Jina Reader): disabled")
+
+    # Tier 3 readiness & live auth verification
+    ready, reason = check_tier3_readiness(config)
+    if ready:
+        try:
+            status_data = verify_tier3_auth(config)
+            user_obj = status_data.get("user") if isinstance(status_data.get("user"), dict) else {}
+            screen_name = str(user_obj.get("screenName") or user_obj.get("username") or "")
+            masked = _mask_handle(screen_name) if screen_name else "verified"
+            print(f"[OK] Tier 3 (twitter-cli): authenticated (source={reason}, user=@{masked})")
+        except TierError as exc:
+            print(f"[FAIL] Tier 3 (twitter-cli): auth verification failed ({exc.code}: {exc})")
+            rc = 1
+    else:
+        print(f"[WARN] Tier 3 (twitter-cli): {reason}")
+        if reason == "alt_account_cookie_not_configured":
+            print(f"       Fill tier3.auth_token and tier3.ct0 in {local_cfg} to enable full Thread & protected fallback.")
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="x-read",
+        description="Fetch X (Twitter) full posts, note_tweets, X Articles, and self-threads in 3 tiers.",
+    )
+    parser.add_argument("target", nargs="?", help="X/Twitter status or article URL, or numeric ID.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--mode", choices=["auto", "single", "article", "thread"], default="auto")
+    mode_group.add_argument("--thread", action="store_const", dest="mode", const="thread", help="Force thread mode.")
+    mode_group.add_argument("--article", action="store_const", dest="mode", const="article", help="Force article mode.")
+    mode_group.add_argument("--single", action="store_const", dest="mode", const="single", help="Force single-post mode.")
+
+    parser.add_argument("--tier", choices=["auto", "1", "2", "3"], default="auto", help="Force a specific tier.")
+    parser.add_argument("--include-replies", type=int, default=0, help="Include top N non-author replies (Tier 3).")
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of Markdown.")
+    parser.add_argument("--no-cache", action="store_true", help="Bypass 1h local cache.")
+    parser.add_argument("-o", "--output", type=str, default="", help="Write full output directly to file path.")
+    parser.add_argument("--config", type=str, default="", help="Optional path to config JSON.")
+    parser.add_argument("--doctor", action="store_true", help="Run diagnostics on Tier 1/2/3.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    config_err = ""
+    try:
+        config = load_config(Path(args.config) if args.config else None)
+    except ConfigError as exc:
+        if args.doctor:
+            return run_doctor(copy.deepcopy(_DEFAULT_CONFIG), config_err=str(exc))
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.doctor:
+        return run_doctor(config)
+
+    if not args.target:
+        parser.error("target URL or ID is required unless --doctor is set")
+
+    try:
+        target = parse_x_target(args.target)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    out_fmt = "json" if args.json else "md"
+    cache_path = _cache_file_path(
+        config,
+        target,
+        args.mode,
+        args.tier,
+        args.include_replies,
+        out_fmt,
+    )
+    ttl = cfg_int(config, "cache_ttl_seconds", 3600)
+
+    rendered = "" if args.no_cache else (_read_cache(cache_path, ttl) or "")
+    if not rendered:
+        try:
+            result = resolve_post(
+                args.target,
+                config=config,
+                mode=args.mode,
+                forced_tier=args.tier,
+                include_replies=args.include_replies,
+            )
+        except TierError as exc:
+            print(f"Error [{exc.code}]: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            rendered = render_json_payload(**result)
+        else:
+            rendered = render_markdown(**result)
+
+        if result.get("completeness") == "full" and not args.no_cache:
+            _write_cache(cache_path, rendered)
+
+    if args.output:
+        out_path = Path(os.path.expanduser(args.output))
+        atomic_write_private(out_path, rendered)
+        print(f"Saved full output ({len(rendered)} chars) to {out_path}")
+        return 0
+
+    sys.stdout.write(apply_spill_guard(rendered, target.tweet_id, config, out_fmt))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
