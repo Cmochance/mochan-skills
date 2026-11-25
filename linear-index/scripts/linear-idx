@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+"""linear-idx: Local multi-team Linear issue index CLI (Python 3.10+ stdlib only)."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from typing import Any, Optional
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_INDEX_DIR = "~/.claude/linear-index/workspace"
+DEFAULT_STALE_HOURS = 24
+OPEN_STATUS_TYPES = frozenset({"triage", "backlog", "unstarted", "started"})
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_WS_RE = re.compile(r"\s+")
+
+
+class CliError(RuntimeError):
+    """Recoverable CLI error mapped to an exit code."""
+
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse UTC/offset ISO-8601 timestamp (compatible with Python 3.10 'Z' suffix)."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def compute_freshness(
+    last_sync: Any,
+    stale_hours: float,
+    now: Optional[datetime] = None,
+) -> tuple[str, Optional[float]]:
+    """Return (freshness, age_hours) for an initialized index."""
+    dt = parse_iso_utc(last_sync)
+    if dt is None:
+        return "STALE", None
+    ref = now or datetime.now(timezone.utc)
+    delta_hours = (ref - dt).total_seconds() / 3600.0
+    # Future timestamp beyond 60s clock-skew tolerance is treated as anomalous -> STALE.
+    if delta_hours < -(60.0 / 3600.0):
+        return "STALE", round(delta_hours, 1)
+    if delta_hours < 0.0:
+        delta_hours = 0.0
+    age_hours = round(delta_hours, 1)
+    freshness = "FRESH" if age_hours <= stale_hours else "STALE"
+    return freshness, age_hours
+
+
+def resolve_runtime_config(
+    config_arg: Optional[str],
+    index_dir_arg: Optional[str],
+) -> dict[str, Any]:
+    """Load config.local.json (or --config) and resolve index_dir / stale_hours / default_team."""
+    raw_cfg: dict[str, Any] = {}
+    if config_arg:
+        cfg_path = Path(config_arg).expanduser()
+        if not cfg_path.exists():
+            raise CliError(f"Config file not found: {cfg_path}", exit_code=1)
+        try:
+            loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CliError(f"Failed to read config {cfg_path}: {exc}", exit_code=1) from exc
+        if not isinstance(loaded, dict):
+            raise CliError(f"Config root must be a JSON object: {cfg_path}", exit_code=1)
+        raw_cfg = loaded
+    else:
+        default_cfg_path = SKILL_ROOT / "config.local.json"
+        if default_cfg_path.exists():
+            try:
+                loaded = json.loads(default_cfg_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise CliError(
+                    f"Failed to read config {default_cfg_path}: {exc}", exit_code=1
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise CliError(
+                    f"Config root must be a JSON object: {default_cfg_path}", exit_code=1
+                )
+            raw_cfg = loaded
+
+    env_index_dir = os.environ.get("LINEAR_INDEX_DIR", "").strip()
+    cfg_index_dir = str(raw_cfg.get("index_dir") or "").strip()
+    chosen_index_dir = (
+        (index_dir_arg or "").strip()
+        or env_index_dir
+        or cfg_index_dir
+        or DEFAULT_INDEX_DIR
+    )
+    index_dir = Path(chosen_index_dir).expanduser()
+
+    raw_stale = raw_cfg.get("stale_hours", DEFAULT_STALE_HOURS)
+    if isinstance(raw_stale, bool):
+        raise CliError(f"Invalid stale_hours value: {raw_stale!r}", exit_code=1)
+    try:
+        stale_hours = float(raw_stale)
+    except (TypeError, ValueError) as exc:
+        raise CliError(f"Invalid stale_hours value: {raw_stale!r}", exit_code=1) from exc
+    if not math.isfinite(stale_hours) or stale_hours < 0:
+        raise CliError(
+            f"Invalid stale_hours value {raw_stale!r}: must be a finite number >= 0",
+            exit_code=1,
+        )
+
+    raw_team = raw_cfg.get("default_team")
+    if raw_team is None:
+        raw_team = raw_cfg.get("team")
+    default_team = str(raw_team).strip() if raw_team is not None and str(raw_team).strip() else None
+
+    return {
+        "index_dir": index_dir,
+        "stale_hours": stale_hours,
+        "default_team": default_team,
+    }
+
+
+def _team_from_id(issue_id: str) -> Optional[str]:
+    if "-" in issue_id and not _UUID_RE.fullmatch(issue_id):
+        prefix = issue_id.split("-", 1)[0].strip()
+        if prefix:
+            return prefix.upper()
+    return None
+
+
+def _extract_named_or_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        name = value.get("name")
+        if name is None:
+            return None
+        s = str(name).strip()
+        return s if s else None
+    s = str(value).strip()
+    return s if s else None
+
+
+def _extract_opt_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def normalize_issue(raw: Any) -> Optional[dict[str, Any]]:
+    """Normalize a heterogeneous Linear MCP / GraphQL / index issue dict into canonical schema."""
+    if not isinstance(raw, dict):
+        return None
+
+    raw_id = raw.get("id")
+    if raw_id is None:
+        return None
+    issue_id = str(raw_id).strip()
+    if not issue_id:
+        return None
+    if "-" in issue_id and not _UUID_RE.fullmatch(issue_id):
+        issue_id = issue_id.upper()
+
+    team = _team_from_id(issue_id)
+    if not team:
+        raw_team = raw.get("team")
+        if isinstance(raw_team, dict):
+            t_candidate = raw_team.get("key") or raw_team.get("name")
+            team = str(t_candidate).strip() if t_candidate is not None and str(t_candidate).strip() else None
+        elif raw_team is not None:
+            t_str = str(raw_team).strip()
+            team = t_str if t_str else None
+
+    raw_title = raw.get("title")
+    title = "" if raw_title is None else str(raw_title)
+
+    status = _extract_named_or_str(raw.get("status"))
+
+    raw_status_type = raw.get("statusType")
+    if raw_status_type is None and isinstance(raw.get("status"), dict):
+        raw_status_type = raw["status"].get("type")
+    status_type = (
+        str(raw_status_type).strip().lower()
+        if raw_status_type is not None and str(raw_status_type).strip()
+        else None
+    )
+
+    priority = _extract_named_or_str(raw.get("priority"))
+
+    raw_labels = raw.get("labels")
+    if isinstance(raw_labels, dict) and isinstance(raw_labels.get("nodes"), list):
+        raw_labels = raw_labels["nodes"]
+    labels: list[str] = []
+    if isinstance(raw_labels, list):
+        for item in raw_labels:
+            if item is None:
+                continue
+            lbl = item.get("name") if isinstance(item, dict) else item
+            if lbl is None:
+                continue
+            lbl_str = str(lbl).strip()
+            if lbl_str:
+                labels.append(lbl_str)
+
+    project = _extract_named_or_str(raw.get("project"))
+
+    raw_milestone = raw.get("projectMilestone")
+    if raw_milestone is None:
+        raw_milestone = raw.get("milestone")
+    milestone = _extract_named_or_str(raw_milestone)
+
+    raw_desc = raw.get("description")
+    if raw_desc is None:
+        raw_desc = raw.get("desc")
+    desc = "" if raw_desc is None else _WS_RE.sub(" ", str(raw_desc)).strip()[:500]
+
+    return {
+        "id": issue_id,
+        "team": team,
+        "title": title,
+        "status": status,
+        "statusType": status_type,
+        "priority": priority,
+        "labels": labels,
+        "project": project,
+        "milestone": milestone,
+        "archivedAt": _extract_opt_str(raw.get("archivedAt")),
+        "createdAt": _extract_opt_str(raw.get("createdAt")),
+        "updatedAt": _extract_opt_str(raw.get("updatedAt")),
+        "completedAt": _extract_opt_str(raw.get("completedAt")),
+        "canceledAt": _extract_opt_str(raw.get("canceledAt")),
+        "url": _extract_opt_str(raw.get("url")),
+        "desc": desc,
+    }
+
+
+def load_issues_jsonl(issues_path: Path) -> list[dict[str, Any]]:
+    """Load issues.jsonl and backfill missing 'team' on legacy rows."""
+    if not issues_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    text = issues_path.read_text(encoding="utf-8")
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CliError(
+                f"Corrupted JSONL in {issues_path}:{line_no}: {exc}", exit_code=1
+            ) from exc
+        if not isinstance(obj, dict):
+            continue
+        issue_id = str(obj.get("id") or "").strip()
+        if not issue_id:
+            continue
+        if "-" in issue_id and not _UUID_RE.fullmatch(issue_id):
+            issue_id = issue_id.upper()
+        obj["id"] = issue_id
+        if not obj.get("team"):
+            obj["team"] = _team_from_id(issue_id)
+        rows.append(obj)
+    return rows
+
+
+def sort_issues(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stable descending sort by (updatedAt or '', id)."""
+    return sorted(rows, key=lambda r: (r.get("updatedAt") or "", r["id"]), reverse=True)
+
+
+def compute_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    archived = 0
+    open_count = 0
+    by_team: dict[str, int] = {}
+    by_status_type: dict[str, int] = {}
+
+    for row in rows:
+        is_archived = row.get("archivedAt") is not None
+        if is_archived:
+            archived += 1
+
+        st = str(row.get("statusType") or "").strip().lower()
+        if st:
+            by_status_type[st] = by_status_type.get(st, 0) + 1
+
+        if not is_archived and st in OPEN_STATUS_TYPES:
+            open_count += 1
+
+        team = row.get("team") or _team_from_id(str(row.get("id") or ""))
+        if team:
+            t_key = str(team)
+            by_team[t_key] = by_team.get(t_key, 0) + 1
+
+    return {
+        "total": total,
+        "archived": archived,
+        "open": open_count,
+        "by_team": dict(sorted(by_team.items())),
+        "by_statusType": dict(sorted(by_status_type.items())),
+    }
+
+
+def build_meta(last_sync: Optional[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    stats = compute_stats(rows)
+    return {
+        "last_sync": last_sync,
+        **stats,
+        "counts": dict(stats),
+    }
+
+
+def atomic_write_text(target: Path, content: str) -> None:
+    """Atomically write text to target using a sibling NamedTemporaryFile + os.replace."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(target.parent),
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, target)
+    except Exception:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def write_index(index_dir: Path, rows: list[dict[str, Any]], last_sync: Optional[str]) -> dict[str, Any]:
+    ordered = sort_issues(rows)
+    jsonl_body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ordered)
+    meta = build_meta(last_sync, ordered)
+    meta_body = json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(index_dir / "issues.jsonl", jsonl_body)
+    atomic_write_text(index_dir / "meta.json", meta_body)
+    return meta
+
+
+def _strict_nonneg_int(val: Any, field: str) -> int:
+    if isinstance(val, bool) or val is None:
+        raise TypeError(f"{field} must be an integer, got {val!r}")
+    out = int(val)
+    if out < 0:
+        raise ValueError(f"{field} must be >= 0, got {out}")
+    return out
+
+
+def _strict_int_map(val: Any, field: str) -> dict[str, int]:
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        raise TypeError(f"{field} must be an object, got {type(val).__name__}")
+    return {str(k): _strict_nonneg_int(v, f"{field}.{k}") for k, v in val.items()}
+
+
+def inspect_index_state(index_dir: Path, stale_hours: float) -> dict[str, Any]:
+    """Read meta.json (falling back to scanning issues.jsonl on corruption or partial legacy meta)."""
+    meta_path = index_dir / "meta.json"
+    issues_path = index_dir / "issues.jsonl"
+
+    if not meta_path.exists():
+        return {
+            "freshness": "UNINITIALIZED",
+            "last_sync": None,
+            "age_hours": None,
+            "total": 0,
+            "archived": 0,
+            "open": 0,
+            "by_team": {},
+            "by_statusType": {},
+        }
+
+    meta: Optional[dict[str, Any]] = None
+    try:
+        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            meta = loaded
+        else:
+            print(
+                f"WARNING: {meta_path} root is not a JSON object; falling back to issues.jsonl",
+                file=sys.stderr,
+            )
+    except (OSError, json.JSONDecodeError) as exc:
+        if issues_path.exists():
+            print(
+                f"WARNING: failed to parse {meta_path} ({exc}); falling back to issues.jsonl",
+                file=sys.stderr,
+            )
+            stats = compute_stats(load_issues_jsonl(issues_path))
+            return {
+                "freshness": "STALE",
+                "last_sync": None,
+                "age_hours": None,
+                **stats,
+            }
+        raise CliError(f"Corrupted meta.json ({meta_path}): {exc}", exit_code=1) from exc
+
+    if meta is None:
+        if issues_path.exists():
+            stats = compute_stats(load_issues_jsonl(issues_path))
+            return {
+                "freshness": "STALE",
+                "last_sync": None,
+                "age_hours": None,
+                **stats,
+            }
+        raise CliError(f"Invalid meta.json ({meta_path}): expected JSON object", exit_code=1)
+
+    last_sync_raw = meta.get("last_sync")
+    last_sync = str(last_sync_raw).strip() if isinstance(last_sync_raw, str) and last_sync_raw.strip() else None
+    freshness, age_hours = compute_freshness(last_sync, stale_hours)
+
+    required_keys = ("total", "archived", "open", "by_team", "by_statusType")
+    try:
+        if all(k in meta for k in required_keys):
+            stats = {
+                "total": _strict_nonneg_int(meta["total"], "total"),
+                "archived": _strict_nonneg_int(meta["archived"], "archived"),
+                "open": _strict_nonneg_int(meta["open"], "open"),
+                "by_team": _strict_int_map(meta["by_team"], "by_team"),
+                "by_statusType": _strict_int_map(meta["by_statusType"], "by_statusType"),
+            }
+        elif issues_path.exists():
+            stats = compute_stats(load_issues_jsonl(issues_path))
+        else:
+            counts = meta.get("counts")
+            if counts is not None and not isinstance(counts, dict):
+                raise TypeError("counts must be an object")
+            counts_dict = counts or {}
+            stats = {
+                "total": _strict_nonneg_int(meta.get("total", counts_dict.get("total", 0)), "total"),
+                "archived": _strict_nonneg_int(
+                    meta.get("archived", counts_dict.get("archived", 0)), "archived"
+                ),
+                "open": _strict_nonneg_int(meta.get("open", counts_dict.get("open", 0)), "open"),
+                "by_team": _strict_int_map(
+                    meta.get("by_team", counts_dict.get("by_team", {})), "by_team"
+                ),
+                "by_statusType": _strict_int_map(
+                    meta.get("by_statusType", counts_dict.get("by_statusType", {})),
+                    "by_statusType",
+                ),
+            }
+    except (TypeError, ValueError) as exc:
+        if issues_path.exists():
+            print(
+                f"WARNING: malformed stats in {meta_path} ({exc}); falling back to issues.jsonl",
+                file=sys.stderr,
+            )
+            stats = compute_stats(load_issues_jsonl(issues_path))
+        else:
+            raise CliError(f"Corrupted meta.json ({meta_path}): {exc}", exit_code=1) from exc
+
+    return {
+        "freshness": freshness,
+        "last_sync": last_sync,
+        "age_hours": age_hours,
+        **stats,
+    }
+
+
+def _strip_spill_header(text: str) -> str:
+    """Strip optional AGY step log timestamps ('Created At:' / 'Completed At:') if present."""
+    lines = text.splitlines()
+    idx = 0
+    saw_header = False
+    while idx < len(lines) and (
+        lines[idx].startswith("Created At:") or lines[idx].startswith("Completed At:")
+    ):
+        saw_header = True
+        idx += 1
+    if not saw_header:
+        return text
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    return "\n".join(lines[idx:])
+
+
+def parse_upsert_payload(text: str, source_name: str) -> tuple[list[dict[str, Any]], bool, Any]:
+    """Parse MCP JSON object, JSON array, or JSONL; return (records, has_next_page, cursor)."""
+    cleaned = _strip_spill_header(text).strip()
+    if not cleaned:
+        return [], False, None
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is not None:
+        return _unpack_json_value(parsed, source_name)
+
+    # Fallback: JSONL (one JSON object per non-empty line)
+    records: list[dict[str, Any]] = []
+    has_next = False
+    cursor: Any = None
+    for line_no, raw_line in enumerate(cleaned.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CliError(
+                f"Invalid JSON/JSONL in {source_name}:{line_no}: {exc}", exit_code=1
+            ) from exc
+        sub_records, sub_next, sub_cursor = _unpack_json_value(item, f"{source_name}:{line_no}")
+        records.extend(sub_records)
+        has_next = sub_next
+        cursor = sub_cursor
+    return records, has_next, cursor
+
+
+def _unpack_json_value(value: Any, source_name: str) -> tuple[list[dict[str, Any]], bool, Any]:
+    if isinstance(value, dict):
+        if isinstance(value.get("issues"), list):
+            page_info = value.get("pageInfo") if isinstance(value.get("pageInfo"), dict) else {}
+            has_next = bool(value.get("hasNextPage", page_info.get("hasNextPage", False)))
+            cursor = value.get("cursor")
+            if cursor is None:
+                cursor = value.get("endCursor", page_info.get("endCursor"))
+            return [x for x in value["issues"] if isinstance(x, dict)], has_next, cursor
+        if isinstance(value.get("result"), str):
+            return parse_upsert_payload(value["result"], source_name)
+        if "id" in value:
+            return [value], False, None
+        raise CliError(
+            f"Unrecognized JSON object in {source_name}: expected 'issues' array or issue object",
+            exit_code=1,
+        )
+
+    if isinstance(value, list):
+        # Support Claude Code tool-results content block wrappers: [{"type": "text", "text": "..."}]
+        if value and all(
+            isinstance(el, dict) and el.get("type") == "text" and isinstance(el.get("text"), str)
+            and "id" not in el
+            for el in value
+        ):
+            merged: list[dict[str, Any]] = []
+            last_next = False
+            last_cursor: Any = None
+            for el in value:
+                sub_rec, sub_next, sub_cur = parse_upsert_payload(el["text"], source_name)
+                merged.extend(sub_rec)
+                last_next = sub_next
+                last_cursor = sub_cur
+            return merged, last_next, last_cursor
+        return [x for x in value if isinstance(x, dict)], False, None
+
+    raise CliError(f"Unsupported JSON payload in {source_name}", exit_code=1)
+
+
+def _split_csv_args(values: Optional[list[str]], *, upper: bool = False, lower: bool = False) -> list[str]:
+    if not values:
+        return []
+    out: list[str] = []
+    for raw in values:
+        for part in raw.split(","):
+            s = part.strip()
+            if not s:
+                continue
+            if upper:
+                s = s.upper()
+            elif lower:
+                s = s.lower()
+            out.append(s)
+    return out
+
+
+def _tsv_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    s = _WS_RE.sub(" ", str(value)).strip()
+    return s if s else "-"
+
+
+def cmd_status(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
+    index_dir: Path = cfg["index_dir"]
+    state = inspect_index_state(index_dir, cfg["stale_hours"])
+    payload = {
+        "index_dir": str(index_dir),
+        "last_sync": state["last_sync"],
+        "age_hours": state["age_hours"],
+        "freshness": state["freshness"],
+        "default_team": cfg["default_team"],
+        "total": state["total"],
+        "archived": state["archived"],
+        "open": state["open"],
+        "by_team": state["by_team"],
+        "by_statusType": state["by_statusType"],
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    by_team_str = (
+        ", ".join(f"{k}={v}" for k, v in payload["by_team"].items())
+        if payload["by_team"]
+        else "-"
+    )
+    by_st_str = (
+        ", ".join(f"{k}={v}" for k, v in payload["by_statusType"].items())
+        if payload["by_statusType"]
+        else "-"
+    )
+    age_str = f"{payload['age_hours']:.1f}" if payload["age_hours"] is not None else "-"
+    print(f"index_dir: {payload['index_dir']}")
+    print(f"freshness: {payload['freshness']}")
+    print(f"last_sync: {payload['last_sync'] or '-'}")
+    print(f"age_hours: {age_str}")
+    print(f"default_team: {payload['default_team'] or '-'}")
+    print(f"total: {payload['total']}")
+    print(f"open: {payload['open']}")
+    print(f"archived: {payload['archived']}")
+    print(f"by_team: {by_team_str}")
+    print(f"by_statusType: {by_st_str}")
+    return 0
+
+
+def cmd_search(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
+    if args.limit < 0:
+        raise CliError("--limit must be >= 0 (0 means unlimited)", exit_code=2)
+
+    index_dir: Path = cfg["index_dir"]
+    state = inspect_index_state(index_dir, cfg["stale_hours"])
+    issues_path = index_dir / "issues.jsonl"
+    all_rows = load_issues_jsonl(issues_path) if issues_path.exists() else []
+    total_indexed = len(all_rows)
+
+    id_set = set(_split_csv_args(args.ids, upper=True))
+    raw_teams = _split_csv_args(args.teams, upper=True)
+    team_set: set[str] = set()
+    use_default_team = bool(args.default_team) or ("DEFAULT" in raw_teams)
+    if use_default_team:
+        if not cfg["default_team"]:
+            raise CliError(
+                "default_team is not configured (set 'default_team' in config.local.json or pass --team <KEY>)",
+                exit_code=1,
+            )
+        team_set.add(str(cfg["default_team"]).upper())
+    for t_key in raw_teams:
+        if t_key != "DEFAULT":
+            team_set.add(t_key)
+    status_type_set = set(_split_csv_args(args.status_types, lower=True))
+    project_q = args.project.strip().lower() if args.project else None
+    milestone_q = args.milestone.strip().lower() if args.milestone else None
+    label_queries = [q.strip().lower() for q in (args.labels or []) if q.strip()]
+    terms = [q.strip().lower() for q in (args.query or []) if q.strip()]
+
+    # Archive visibility rule:
+    # - --open always excludes archived items
+    # - otherwise, if --id is given OR --include-archived is set, archived items are included
+    # - otherwise, archived items are excluded by default
+    allow_archived = (not args.open_only) and (args.include_archived or bool(id_set))
+
+    matched: list[dict[str, Any]] = []
+    for row in all_rows:
+        is_archived = row.get("archivedAt") is not None
+        if not allow_archived and is_archived:
+            continue
+
+        row_id_upper = str(row.get("id") or "").upper()
+        if id_set and row_id_upper not in id_set:
+            continue
+
+        row_team = str(row.get("team") or _team_from_id(str(row.get("id") or "")) or "").upper()
+        if team_set and row_team not in team_set:
+            continue
+
+        row_st = str(row.get("statusType") or "").strip().lower()
+        if args.open_only and (is_archived or row_st not in OPEN_STATUS_TYPES):
+            continue
+
+        if status_type_set and row_st not in status_type_set:
+            continue
+
+        if project_q is not None and project_q not in str(row.get("project") or "").lower():
+            continue
+
+        if milestone_q is not None and milestone_q not in str(row.get("milestone") or "").lower():
+            continue
+
+        if label_queries:
+            row_labels = [str(x).lower() for x in (row.get("labels") or []) if x is not None]
+            if not all(any(lq in rl for rl in row_labels) for lq in label_queries):
+                continue
+
+        if terms:
+            labels_joined = " ".join(str(x) for x in (row.get("labels") or []) if x is not None)
+            haystack = "\n".join(
+                (
+                    str(row.get("id") or ""),
+                    str(row.get("title") or ""),
+                    str(row.get("desc") or ""),
+                    str(row.get("project") or ""),
+                    str(row.get("milestone") or ""),
+                    labels_joined,
+                )
+            ).lower()
+            if args.any_match:
+                if not any(t in haystack for t in terms):
+                    continue
+            else:
+                if not all(t in haystack for t in terms):
+                    continue
+
+        matched.append(row)
+
+    returned_rows = matched if args.limit == 0 else matched[: args.limit]
+
+    if args.json:
+        out = {
+            "freshness": state["freshness"],
+            "last_sync": state["last_sync"],
+            "age_hours": state["age_hours"],
+            "total_indexed": total_indexed,
+            "total_matched": len(matched),
+            "returned": len(returned_rows),
+            "issues": returned_rows,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    age_str = f"{state['age_hours']:.1f}h" if state["age_hours"] is not None else "-"
+    sync_str = state["last_sync"] or "-"
+    print(
+        f"# index: {state['freshness']} "
+        f"(age={age_str}, last_sync={sync_str}, matched={len(matched)}/{total_indexed}, returned={len(returned_rows)})"
+    )
+    for row in returned_rows:
+        team_val = row.get("team") or _team_from_id(str(row.get("id") or ""))
+        cols = [
+            _tsv_cell(row.get("id")),
+            _tsv_cell(team_val),
+            _tsv_cell(row.get("status")),
+            _tsv_cell(row.get("project")),
+            _tsv_cell(row.get("title")),
+        ]
+        if args.desc:
+            cols.append(_tsv_cell(row.get("desc")))
+        print("\t".join(cols))
+    return 0
+
+
+def cmd_upsert(args: argparse.Namespace, cfg: dict[str, Any], parser: argparse.ArgumentParser) -> int:
+    if not args.files and not args.stdin:
+        parser.print_usage(sys.stderr)
+        print("linear-idx upsert: error: provide at least one file path or --stdin", file=sys.stderr)
+        return 2
+
+    sources: list[tuple[str, str]] = []
+    for file_arg in args.files:
+        fpath = Path(file_arg).expanduser()
+        if not fpath.exists():
+            raise CliError(f"Input file not found: {fpath}", exit_code=1)
+        try:
+            sources.append((str(fpath), fpath.read_text(encoding="utf-8")))
+        except OSError as exc:
+            raise CliError(f"Failed to read {fpath}: {exc}", exit_code=1) from exc
+
+    if args.stdin:
+        sources.append(("<stdin>", sys.stdin.read()))
+
+    index_dir: Path = cfg["index_dir"]
+    merged: dict[str, dict[str, Any]] = {}
+    if not args.rebuild:
+        for existing in load_issues_jsonl(index_dir / "issues.jsonl"):
+            merged[existing["id"].upper()] = existing
+
+    upserted_count = 0
+    last_has_next = False
+    last_cursor: Any = None
+
+    for src_name, raw_text in sources:
+        records, has_next, cursor = parse_upsert_payload(raw_text, src_name)
+        last_has_next = has_next
+        last_cursor = cursor
+        for rec in records:
+            norm = normalize_issue(rec)
+            if norm is None:
+                continue
+            merged[norm["id"].upper()] = norm
+            upserted_count += 1
+
+    now_iso = utc_now_iso()
+    meta = write_index(index_dir, list(merged.values()), now_iso)
+    mode = "rebuild" if args.rebuild else "incremental"
+    print(
+        f"Upserted {upserted_count} record(s) [{mode}]: "
+        f"total={meta['total']}, open={meta['open']}, archived={meta['archived']} ({index_dir})"
+    )
+
+    if last_has_next:
+        print(
+            f"WARNING: last input reports hasNextPage=true (cursor={last_cursor}) "
+            "— fetch remaining pages to avoid partial sync",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_mark_archived(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
+    requested = _split_csv_args(args.ids, upper=True)
+    if not requested:
+        raise CliError("Provide at least one issue ID", exit_code=2)
+
+    # Preserve order while deduplicating
+    ordered_ids = list(dict.fromkeys(requested))
+    target_set = set(ordered_ids)
+
+    index_dir: Path = cfg["index_dir"]
+    issues_path = index_dir / "issues.jsonl"
+    if not issues_path.exists():
+        raise CliError(f"Index not initialized (missing {issues_path})", exit_code=1)
+
+    rows = load_issues_jsonl(issues_path)
+    stamp = None if args.unarchive else utc_now_iso()
+    found_upper: set[str] = set()
+
+    for row in rows:
+        rid_upper = str(row.get("id") or "").upper()
+        if rid_upper in target_set:
+            row["archivedAt"] = stamp
+            found_upper.add(rid_upper)
+
+    missing = [iid for iid in ordered_ids if iid not in found_upper]
+    if missing:
+        print(
+            f"WARNING: ID(s) not found in index: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+
+    # Preserve existing last_sync because archiving does not sync workspace updates.
+    existing_last_sync: Optional[str] = None
+    meta_path = index_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(old_meta, dict) and isinstance(old_meta.get("last_sync"), str):
+                existing_last_sync = old_meta["last_sync"]
+        except (OSError, json.JSONDecodeError):
+            existing_last_sync = None
+
+    meta = write_index(index_dir, rows, existing_last_sync)
+    action = "unarchived" if args.unarchive else "archived"
+    print(
+        f"Marked {len(found_upper)} issue(s) {action}: "
+        f"total={meta['total']}, open={meta['open']}, archived={meta['archived']}"
+    )
+    return 0
+
+
+def build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    shared_sub = argparse.ArgumentParser(add_help=False)
+    shared_sub.add_argument(
+        "--config",
+        dest="sub_config",
+        default=None,
+        metavar="PATH",
+        help="Path to config JSON (defaults to <skill_root>/config.local.json if present)",
+    )
+    shared_sub.add_argument(
+        "--index-dir",
+        dest="sub_index_dir",
+        default=None,
+        metavar="PATH",
+        help="Override index directory (also overrides LINEAR_INDEX_DIR and config)",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="linear-idx",
+        description="Local multi-team Linear issue index CLI",
+    )
+    parser.add_argument(
+        "--config",
+        dest="global_config",
+        default=None,
+        metavar="PATH",
+        help="Path to config JSON (defaults to <skill_root>/config.local.json if present)",
+    )
+    parser.add_argument(
+        "--index-dir",
+        dest="global_index_dir",
+        default=None,
+        metavar="PATH",
+        help="Override index directory (also overrides LINEAR_INDEX_DIR and config)",
+    )
+
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    p_status = subparsers.add_parser(
+        "status",
+        parents=[shared_sub],
+        help="Show index freshness, last_sync, and issue counts",
+    )
+    p_status.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    p_search = subparsers.add_parser(
+        "search",
+        parents=[shared_sub],
+        help="Search indexed issues across all workspace teams",
+    )
+    p_search.add_argument(
+        "query",
+        nargs="*",
+        help="Case-insensitive substring keywords (AND by default, OR with --any)",
+    )
+    p_search.add_argument("--any", dest="any_match", action="store_true", help="Match ANY keyword (OR)")
+    p_search.add_argument(
+        "--id",
+        dest="ids",
+        action="append",
+        metavar="ID",
+        help="Exact issue ID(s), repeatable or comma-separated (includes archived by default)",
+    )
+    p_search.add_argument(
+        "--team",
+        dest="teams",
+        action="append",
+        metavar="KEY",
+        help="Team key filter (e.g. CHX, CHX,MOC, or 'default'); omit to search all teams",
+    )
+    p_search.add_argument(
+        "--default-team",
+        action="store_true",
+        help="Restrict search to config.default_team",
+    )
+    p_search.add_argument("--project", default=None, metavar="SUBSTR", help="Project substring filter")
+    p_search.add_argument("--milestone", default=None, metavar="SUBSTR", help="Milestone substring filter")
+    p_search.add_argument(
+        "--label",
+        dest="labels",
+        action="append",
+        metavar="LABEL",
+        help="Label substring/name filter (repeatable)",
+    )
+    p_search.add_argument(
+        "--open",
+        dest="open_only",
+        action="store_true",
+        help="Only unarchived open issues (triage, backlog, unstarted, started)",
+    )
+    p_search.add_argument(
+        "--status-type",
+        dest="status_types",
+        action="append",
+        metavar="TYPES",
+        help="Comma-separated statusType exact filter (case-insensitive)",
+    )
+    p_search.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Include archived issues in non-ID searches",
+    )
+    p_search.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Max returned rows (default 30; 0 for unlimited)",
+    )
+    p_search.add_argument("--desc", action="store_true", help="Append desc column in TSV mode")
+    p_search.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    p_upsert = subparsers.add_parser(
+        "upsert",
+        parents=[shared_sub],
+        help="Upsert MCP JSON / JSON array / JSONL payload(s) into local index",
+    )
+    p_upsert.add_argument("files", nargs="*", help="One or more input JSON/JSONL file paths")
+    p_upsert.add_argument("--rebuild", action="store_true", help="Discard existing index and rebuild")
+    p_upsert.add_argument("--stdin", action="store_true", help="Read payload from stdin")
+
+    p_mark = subparsers.add_parser(
+        "mark-archived",
+        parents=[shared_sub],
+        help="Mark issue ID(s) as archived (or unarchived) in local index",
+    )
+    p_mark.add_argument("ids", nargs="+", metavar="ID", help="Issue ID(s), space or comma separated")
+    p_mark.add_argument("--unarchive", action="store_true", help="Clear archivedAt back to null")
+
+    return parser, p_upsert
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser, p_upsert = build_parser()
+    args = parser.parse_args(argv)
+    if not args.subcommand:
+        parser.print_help(sys.stderr)
+        return 2
+
+    config_arg = getattr(args, "sub_config", None) or args.global_config
+    index_dir_arg = getattr(args, "sub_index_dir", None) or args.global_index_dir
+
+    try:
+        cfg = resolve_runtime_config(config_arg, index_dir_arg)
+        if args.subcommand == "status":
+            return cmd_status(args, cfg)
+        if args.subcommand == "search":
+            return cmd_search(args, cfg)
+        if args.subcommand == "upsert":
+            return cmd_upsert(args, cfg, p_upsert)
+        if args.subcommand == "mark-archived":
+            return cmd_mark_archived(args, cfg)
+    except CliError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return exc.exit_code
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
