@@ -4,7 +4,7 @@
 
 以 **Gemini 4 Hydrogen** 担任零额外损耗的前台总调度台，按任务属性精准路由至 **Gemini 4 Neon**（分析/编码）与 **Gemini 4 Carbon**（规划/对抗审查），并在实质编码后自动执行 **一审 + 大改动/高危修复二审闭环**。
 
-## 架构与能力（v1.2.0）
+## 架构与能力（v1.3.0）
 
 - **1. 五级智能路由与豁免（`rules/AGENTS.md`）**
   - **简单调研 / 快速问答**：前台 Hydrogen 原地直答，禁止调用 `tri-router`。
@@ -17,6 +17,7 @@
 
 - **2. 零依赖并发 MCP 调度引擎（`server/tri_router_mcp.py`）**
   - 纯 Python 标准库实现，兼容 newline-delimited JSON 与 `Content-Length` 双帧协议，支持 `ping` 心跳、进度通知与 `notifications/cancelled` 进程组强杀（`SIGTERM` → `SIGKILL`）。
+  - **150s 安全窗口 + 后台任务续等（`await_pipeline` / `cancel_pipeline`）**：`≤ 150s` 的任务同步直出零额外回合；超过 `150s` 自动转为后台保留任务并返回 `job_id`，前台调用 `await_pipeline` 分段续等，彻底规避 AGY 客户端 `3m0s` 单次 MCP 硬超时误杀。
   - **分级 Prompt 投递**：`≤ 32KB` 直接内联 `-p` 零额外往返；`> 32KB` 才落盘受限临时文件。
   - **基线零污染隔离**：基于临时 `GIT_INDEX_FILE` + `GIT_OBJECT_DIRECTORY` 抓取纯净增量 Diff，不向目标仓库 `.git/objects` 写入松散对象；非 Git 目录按 `(size, mtime_ns)` `O(1)` 跳过未改文件。
 
@@ -54,3 +55,4 @@ agy plugin list
 | `TRI_MODEL_CARBON_PLANNER` | `gemini-4-carbon-high` | 覆盖项目规划模型标识 |
 | `TRI_MODEL_CARBON_REVIEWER` | `gemini-4-carbon-high` | 覆盖代码审查模型标识 |
 | `TRI_PIPELINE_TIMEOUT_SEC` | `1200` | `execute_with_review` 单次全链路总超时预算（秒） |
+| `TRI_WAIT_WINDOW_SEC` | `150` | 单次工具调用阻塞等待窗口（5–165 秒），超时转后台并返回 `job_id` |

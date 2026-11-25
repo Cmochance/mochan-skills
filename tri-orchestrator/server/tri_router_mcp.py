@@ -19,7 +19,7 @@ import time
 from typing import Any, Callable
 import uuid
 
-SERVER_INFO = {"name": "tri-router", "version": "1.1.0"}
+SERVER_INFO = {"name": "tri-router", "version": "1.3.0"}
 EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 MODELS = {
@@ -30,6 +30,8 @@ MODELS = {
 }
 
 PIPELINE_BUDGET_SEC = max(120, int(os.environ.get("TRI_PIPELINE_TIMEOUT_SEC", "1200")))
+DEFAULT_WAIT_WINDOW_SEC = max(5, min(165, int(os.environ.get("TRI_WAIT_WINDOW_SEC", "150"))))
+JOB_TTL_SEC = 3600
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -233,6 +235,37 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["task", "cwd"],
         },
     },
+    {
+        "name": "await_pipeline",
+        "description": (
+            "Continue waiting for a background tri-router job that returned Status: RUNNING with a job_id "
+            "at the 150s safe window. Blocks up to wait_seconds (default 150s) and returns either the final "
+            "report or an updated RUNNING status."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID returned by a RUNNING tri-router call."},
+                "wait_seconds": {
+                    "type": "integer",
+                    "default": 150,
+                    "description": "Window to wait before returning RUNNING again (0-165s; default 150).",
+                },
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "cancel_pipeline",
+        "description": "Cancel a running background tri-router job by job_id and terminate its child process group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID of the background tri-router job to cancel."},
+            },
+            "required": ["job_id"],
+        },
+    },
 ]
 
 
@@ -333,6 +366,20 @@ class CancelContext:
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
         self._pgids: set[int] = set()
+        self._progress_hook: Callable[[str], None] | None = None
+
+    def set_progress_hook(self, hook: Callable[[str], None] | None) -> None:
+        with self._lock:
+            self._progress_hook = hook
+
+    def record_stage(self, message: str) -> None:
+        with self._lock:
+            hook = self._progress_hook
+        if hook is not None:
+            try:
+                hook(message)
+            except Exception:
+                pass
 
     def register_pgid(self, pgid: int) -> None:
         with self._lock:
@@ -352,6 +399,7 @@ class CancelContext:
             _kill_pgid(pgid)
 
     def emit_progress(self, progress: int, total: int, message: str) -> None:
+        self.record_stage(message)
         sys.stderr.write(f"[tri-router] ({progress}/{total}) {message}\n")
         sys.stderr.flush()
         if self.progress_token is not None and self.send_fn is not None:
@@ -530,7 +578,9 @@ def run_agy(
                     break
                 if now - last_beat >= 25.0:
                     last_beat = now
-                    sys.stderr.write(f"[tri-router] {model_slug} running ({int(now - started)}s)...\n")
+                    msg = f"{model_slug} running ({int(now - started)}s)..."
+                    ctx.record_stage(msg)
+                    sys.stderr.write(f"[tri-router] {msg}\n")
                     sys.stderr.flush()
                 time.sleep(0.25)
 
@@ -1837,6 +1887,155 @@ DISPATCH = {
 }
 
 
+def _resolve_wait_window(args: dict[str, Any]) -> int:
+    raw = args.get("wait_seconds")
+    if raw is None:
+        return DEFAULT_WAIT_WINDOW_SEC
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_WINDOW_SEC
+    return max(0, min(165, val))
+
+
+class PipelineJob:
+    """Background job state for long-running tri-router tool calls."""
+
+    def __init__(self, job_id: str, tool_name: str, cwd: str, cancel_ctx: CancelContext) -> None:
+        self.job_id = job_id
+        self.tool_name = tool_name
+        self.cwd = cwd
+        self.cancel_ctx = cancel_ctx
+        self.started_at = time.monotonic()
+        self.finished_at: float | None = None
+        self.done_event = threading.Event()
+        self._lock = threading.Lock()
+        self.status = "running"
+        self.current_stage = "Initializing..."
+        self.progress_history: list[str] = []
+        self.result_text: str | None = None
+        self.result_is_error = False
+
+    def on_progress(self, message: str) -> None:
+        elapsed = int(max(0.0, time.monotonic() - self.started_at))
+        entry = f"[+{elapsed}s] {message}"
+        with self._lock:
+            self.current_stage = message
+            self.progress_history.append(entry)
+            if len(self.progress_history) > 20:
+                self.progress_history = self.progress_history[-20:]
+
+    def finish(self, text: str, is_error: bool) -> None:
+        with self._lock:
+            self.result_text = text
+            self.result_is_error = is_error
+            self.finished_at = time.monotonic()
+            if self.cancel_ctx.cancelled.is_set():
+                self.status = "cancelled"
+            elif is_error:
+                self.status = "failed"
+            else:
+                self.status = "completed"
+        self.done_event.set()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "job_id": self.job_id,
+                "tool_name": self.tool_name,
+                "cwd": self.cwd,
+                "status": self.status,
+                "elapsed_sec": round((self.finished_at or time.monotonic()) - self.started_at, 1),
+                "current_stage": self.current_stage,
+                "progress_history": list(self.progress_history[-8:]),
+                "result_text": self.result_text,
+                "result_is_error": self.result_is_error,
+            }
+
+
+class JobManager:
+    """Thread-safe registry for background tri-router jobs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, PipelineJob] = {}
+
+    def _prune_locked(self, now: float) -> None:
+        stale = [
+            jid
+            for jid, job in self._jobs.items()
+            if job.finished_at is not None and (now - job.finished_at) > JOB_TTL_SEC
+        ]
+        for jid in stale:
+            self._jobs.pop(jid, None)
+
+    def start_job(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        handler: Callable[[dict[str, Any], CancelContext], tuple[str, bool]],
+    ) -> PipelineJob:
+        job_id = f"tri-{uuid.uuid4().hex[:8]}"
+        cancel_ctx = CancelContext(req_id=job_id)
+        cwd_str = _safe_str(args.get("cwd")).strip() or "-"
+        job = PipelineJob(job_id=job_id, tool_name=tool_name, cwd=cwd_str, cancel_ctx=cancel_ctx)
+        cancel_ctx.set_progress_hook(job.on_progress)
+        with self._lock:
+            self._prune_locked(time.monotonic())
+            self._jobs[job_id] = job
+
+        def _runner() -> None:
+            try:
+                text, is_error = handler(args, cancel_ctx)
+                job.finish(text, is_error)
+            except Exception as exc:
+                job.finish(f"Tool `{tool_name}` failed: {exc}", True)
+
+        t = threading.Thread(target=_runner, name=f"tri-job-{job_id}", daemon=True)
+        t.start()
+        return job
+
+    def get_job(self, job_id: str) -> PipelineJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    @staticmethod
+    def format_running(job: PipelineJob) -> str:
+        snap = job.snapshot()
+        hist = "\n".join(f"- {item}" for item in snap["progress_history"]) or "- (waiting for first progress update)"
+        return (
+            "## Tri-Orchestrator Background Job Running\n"
+            "- **Status:** `RUNNING` *(safe-window handoff before host 3m0s timeout; background job continues)*\n"
+            f"- **job_id:** `{snap['job_id']}`\n"
+            f"- **Tool:** `{snap['tool_name']}`\n"
+            f"- **Elapsed:** `{snap['elapsed_sec']}s`\n"
+            f"- **Current Stage:** {snap['current_stage']}\n\n"
+            "### Recent Progress\n"
+            f"{hist}\n\n"
+            "### Next Action\n"
+            f"Call `await_pipeline(job_id=\"{snap['job_id']}\")` immediately to continue waiting for completion "
+            f"(or `cancel_pipeline(job_id=\"{snap['job_id']}\")` to abort)."
+        )
+
+    def cancel_job(self, job_id: str) -> tuple[str, bool]:
+        job = self.get_job(job_id)
+        if job is None:
+            return f"Unknown job_id `{job_id}` (not found or expired).", True
+        if job.done_event.is_set():
+            snap = job.snapshot()
+            return f"Job `{job_id}` already finished with status `{snap['status']}`.", False
+        job.cancel_ctx.cancel()
+        job.done_event.wait(timeout=2.5)
+        return f"Cancelled background job `{job_id}` (`{job.tool_name}`).", False
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            if not job.done_event.is_set():
+                job.cancel_ctx.cancel()
+
+
 def read_next_message(stream: Any) -> tuple[dict[str, Any] | None, str, str | None]:
     """Read newline-delimited or Content-Length MCP JSON-RPC message safely."""
     while True:
@@ -1895,6 +2094,7 @@ def main() -> int:
     write_lock = threading.Lock()
     active_lock = threading.Lock()
     active_contexts: dict[Any, CancelContext] = {}
+    job_manager = JobManager()
     initial_ppid = os.getppid()
 
     def cancel_all_active() -> None:
@@ -1902,6 +2102,7 @@ def main() -> int:
             remaining = list(active_contexts.values())
         for ctx in remaining:
             ctx.cancel()
+        job_manager.cancel_all()
 
     def _on_term_signal(_signum: int, _frame: Any) -> None:
         cancel_all_active()
@@ -1937,8 +2138,36 @@ def main() -> int:
         framing: str,
     ) -> None:
         try:
-            handler = DISPATCH[tool_name]
-            text, is_error = handler(tool_args, ctx)
+            wait_sec = _resolve_wait_window(tool_args)
+            if tool_name == "await_pipeline":
+                job_id = _safe_str(tool_args.get("job_id")).strip()
+                job = job_manager.get_job(job_id) if job_id else None
+                if job is None:
+                    text, is_error = f"Unknown job_id `{job_id}` (not found or expired).", True
+                else:
+                    with active_lock:
+                        active_contexts[req_id] = job.cancel_ctx
+                    finished = job.done_event.wait(timeout=wait_sec)
+                    if finished:
+                        snap = job.snapshot()
+                        text = snap["result_text"] or ""
+                        is_error = bool(snap["result_is_error"])
+                    else:
+                        text, is_error = job_manager.format_running(job), False
+            elif tool_name == "cancel_pipeline":
+                job_id = _safe_str(tool_args.get("job_id")).strip()
+                text, is_error = job_manager.cancel_job(job_id)
+            else:
+                job = job_manager.start_job(tool_name, tool_args, DISPATCH[tool_name])
+                with active_lock:
+                    active_contexts[req_id] = job.cancel_ctx
+                finished = job.done_event.wait(timeout=wait_sec)
+                if finished:
+                    snap = job.snapshot()
+                    text = snap["result_text"] or ""
+                    is_error = bool(snap["result_is_error"])
+                else:
+                    text, is_error = job_manager.format_running(job), False
             resp = {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -2051,7 +2280,8 @@ def main() -> int:
 
                 tool_name = params.get("name")
                 tool_args = params.get("arguments")
-                if not isinstance(tool_name, str) or tool_name not in DISPATCH:
+                valid_tools = set(DISPATCH) | {"await_pipeline", "cancel_pipeline"}
+                if not isinstance(tool_name, str) or tool_name not in valid_tools:
                     send_json(
                         {
                             "jsonrpc": "2.0",
@@ -2101,6 +2331,7 @@ def main() -> int:
                 cancel_all_active()
                 break
             time.sleep(0.25)
+        job_manager.cancel_all()
     return 0
 
 
