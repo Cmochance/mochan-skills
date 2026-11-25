@@ -367,7 +367,15 @@ class CancelContext:
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
         self._pgids: set[int] = set()
+        self._linked: list[CancelContext] = []
         self._progress_hook: Callable[[str], None] | None = None
+
+    def link_target(self, target: CancelContext) -> None:
+        with self._lock:
+            self._linked.append(target)
+            already = self.cancelled.is_set()
+        if already:
+            target.cancel()
 
     def set_progress_hook(self, hook: Callable[[str], None] | None) -> None:
         with self._lock:
@@ -396,6 +404,9 @@ class CancelContext:
         self.cancelled.set()
         with self._lock:
             pgids = list(self._pgids)
+            linked = list(self._linked)
+        for target in linked:
+            target.cancel()
         for pgid in pgids:
             _kill_pgid(pgid)
 
@@ -2146,8 +2157,7 @@ def main() -> int:
                 if job is None:
                     text, is_error = f"Unknown job_id `{job_id}` (not found or expired).", True
                 else:
-                    with active_lock:
-                        active_contexts[req_id] = job.cancel_ctx
+                    ctx.link_target(job.cancel_ctx)
                     finished = job.done_event.wait(timeout=wait_sec)
                     if finished:
                         snap = job.snapshot()
@@ -2160,8 +2170,7 @@ def main() -> int:
                 text, is_error = job_manager.cancel_job(job_id)
             else:
                 job = job_manager.start_job(tool_name, tool_args, DISPATCH[tool_name])
-                with active_lock:
-                    active_contexts[req_id] = job.cancel_ctx
+                ctx.link_target(job.cancel_ctx)
                 finished = job.done_event.wait(timeout=wait_sec)
                 if finished:
                     snap = job.snapshot()
@@ -2188,7 +2197,10 @@ def main() -> int:
                 active_contexts.pop(req_id, None)
         send_json(resp, framing)
 
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="tri-worker") as executor:
+    with (
+        ThreadPoolExecutor(max_workers=16, thread_name_prefix="tri-worker") as executor,
+        ThreadPoolExecutor(max_workers=4, thread_name_prefix="tri-cancel") as cancel_executor,
+    ):
         while True:
             msg, framing, parse_err = read_next_message(stdin)
             if msg is None and parse_err is None:
@@ -2310,7 +2322,8 @@ def main() -> int:
                 ctx = CancelContext(req_id=req_id, progress_token=prog_token, send_fn=make_sender(framing))
                 with active_lock:
                     active_contexts[req_id] = ctx
-                executor.submit(run_tool_async, req_id, tool_name, tool_args, ctx, framing)
+                target_pool = cancel_executor if tool_name == "cancel_pipeline" else executor
+                target_pool.submit(run_tool_async, req_id, tool_name, tool_args, ctx, framing)
             else:
                 send_json(
                     {

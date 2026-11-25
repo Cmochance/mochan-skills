@@ -12,6 +12,13 @@ tri = importlib.util.module_from_spec(SPEC)
 sys.modules["tri_router_mcp"] = tri
 SPEC.loader.exec_module(tri)
 
+GUARD_PATH = Path(__file__).resolve().parent.parent / "scripts" / "readonly-guard.py"
+GUARD_SPEC = importlib.util.spec_from_file_location("readonly_guard", GUARD_PATH)
+assert GUARD_SPEC is not None and GUARD_SPEC.loader is not None
+guard = importlib.util.module_from_spec(GUARD_SPEC)
+sys.modules["readonly_guard"] = guard
+GUARD_SPEC.loader.exec_module(guard)
+
 
 class TriRouterJobsTest(unittest.TestCase):
     def test_fast_job_completes_within_window(self) -> None:
@@ -80,6 +87,37 @@ class TriRouterJobsTest(unittest.TestCase):
         miss_msg, miss_err = jm.cancel_job("tri-nonexistent")
         self.assertTrue(miss_err)
         self.assertIn("Unknown job_id", miss_msg)
+
+    def test_cancel_context_link_target_before_and_after_cancel(self) -> None:
+        # Cancel happens BEFORE link_target (race window simulation)
+        wait_ctx_1 = tri.CancelContext(req_id="r1")
+        job_ctx_1 = tri.CancelContext(req_id="j1")
+        wait_ctx_1.cancel()
+        wait_ctx_1.link_target(job_ctx_1)
+        self.assertTrue(job_ctx_1.cancelled.is_set())
+
+        # Cancel happens AFTER link_target
+        wait_ctx_2 = tri.CancelContext(req_id="r2")
+        job_ctx_2 = tri.CancelContext(req_id="j2")
+        wait_ctx_2.link_target(job_ctx_2)
+        self.assertFalse(job_ctx_2.cancelled.is_set())
+        wait_ctx_2.cancel()
+        self.assertTrue(job_ctx_2.cancelled.is_set())
+
+    def test_readonly_guard_blocks_rg_pre_and_git_ext_diff_and_env(self) -> None:
+        self.assertTrue(guard.is_safe_readonly_shell("rg -n 'foo' src")[0])
+        self.assertTrue(guard.is_safe_readonly_shell("git --no-pager diff -- '*.py'")[0])
+
+        for bad_cmd in (
+            "rg --pre sh pattern src",
+            "rg --pre=sh pattern src",
+            "git diff --ext-diff HEAD",
+            "GIT_EXTERNAL_DIFF=/tmp/evil git diff",
+            "GIT_PAGER=sh git log -n 5",
+            "PAGER=sh git show HEAD",
+        ):
+            ok, _reason = guard.is_safe_readonly_shell(bad_cmd)
+            self.assertFalse(ok, f"Expected blocked in readonly mode: {bad_cmd}")
 
 
 if __name__ == "__main__":

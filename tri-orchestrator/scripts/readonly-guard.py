@@ -71,6 +71,10 @@ BLOCKED_ENV_ASSIGNMENTS = frozenset(
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "PAGER",
+        "LESSOPEN",
         "BASH_ENV",
         "ENV",
         "ZDOTDIR",
@@ -306,6 +310,8 @@ def _validate_git_tokens(tokens: list[str]) -> tuple[bool, str]:
     for arg in rest:
         if arg == "--output" or arg.startswith("--output="):
             return False, "Git `--output` file writing is forbidden in read-only mode."
+        if arg == "--ext-diff" or arg.startswith("--ext-diff="):
+            return False, "Git `--ext-diff` external execution is forbidden in read-only mode."
 
     if subcmd in ("branch", "tag"):
         has_list_flag = False
@@ -377,6 +383,10 @@ def is_safe_readonly_shell(cmd_str: str) -> tuple[bool, str]:
             continue
 
         if cmd0 in SAFE_INSPECT_BINS:
+            if cmd0 == "rg":
+                for arg in tokens[1:]:
+                    if arg == "--pre" or arg.startswith("--pre="):
+                        return False, "`rg --pre` preprocessor execution is forbidden in read-only mode."
             if cmd0 == "sort":
                 for arg in tokens[1:]:
                     if arg == "-o" or arg.startswith("-o") or arg == "--output" or arg.startswith("--output="):
