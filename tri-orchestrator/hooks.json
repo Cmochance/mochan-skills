@@ -1,0 +1,16 @@
+{
+  "tri-readonly-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "write_file|edit_file|run_command|call_mcp_tool|.*tri[-_]router.*|manage_task|invoke_subagent|define_subagent|manage_subagents|run_workflow|swarm|schedule|send_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B ./scripts/readonly-guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
