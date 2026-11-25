@@ -29,7 +29,8 @@ MODELS = {
     "carbon_reviewer": os.environ.get("TRI_MODEL_CARBON_REVIEWER", "gemini-4-carbon-high"),
 }
 
-PIPELINE_BUDGET_SEC = max(120, int(os.environ.get("TRI_PIPELINE_TIMEOUT_SEC", "1200")))
+PIPELINE_BUDGET_SEC = max(120, int(os.environ.get("TRI_PIPELINE_TIMEOUT_SEC", "1800")))
+CARBON_TIMEOUT_SEC = max(120, int(os.environ.get("TRI_CARBON_TIMEOUT_SEC", "600")))
 DEFAULT_WAIT_WINDOW_SEC = max(5, min(165, int(os.environ.get("TRI_WAIT_WINDOW_SEC", "150"))))
 JOB_TTL_SEC = 3600
 
@@ -1395,7 +1396,7 @@ def handle_carbon_planner(args: dict[str, Any], cancel_ctx: CancelContext) -> tu
         prompt=prompt,
         cwd=cwd,
         access_mode="readonly",
-        timeout_sec=360,
+        timeout_sec=CARBON_TIMEOUT_SEC,
         resume_id=args.get("resume_session_id"),
         cancel_ctx=cancel_ctx,
     )
@@ -1431,7 +1432,7 @@ def handle_carbon_reviewer(args: dict[str, Any], cancel_ctx: CancelContext) -> t
     res, review = run_carbon_review_with_retry(
         prompt=prompt,
         cwd=cwd,
-        timeout_sec=360,
+        timeout_sec=CARBON_TIMEOUT_SEC,
         resume_id=args.get("resume_session_id"),
         cancel_ctx=cancel_ctx,
         inline_prefix=inline_prefix,
@@ -1576,7 +1577,7 @@ def _execute_with_review_inner(
     is_large_1 = (diff_1["changed_lines"] >= large_lines) or (diff_1["changed_files"] >= large_files)
 
     # Phase 2: Mandatory Carbon Round-1 Review.
-    t2 = _remaining_timeout(pipeline_deadline, 360)
+    t2 = _remaining_timeout(pipeline_deadline, CARBON_TIMEOUT_SEC)
     if t2 is None:
         return _build_failure_report(
             "Pipeline Budget Exhausted Before Phase 2 (Carbon Round-1 Review)",
@@ -1695,7 +1696,7 @@ def _execute_with_review_inner(
     final_diff = diff_after_fix1
 
     if trigger_r2:
-        t3 = _remaining_timeout(pipeline_deadline, 360)
+        t3 = _remaining_timeout(pipeline_deadline, CARBON_TIMEOUT_SEC)
         if t3 is None:
             return _build_failure_report(
                 "Pipeline Budget Exhausted Before Phase 3 (Carbon Round-2 Review)",
