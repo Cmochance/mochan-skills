@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilibili2mp3"
+version = "0.2.0"
+description = "Extract Bilibili video audio to MP3 with embedded lyrics/subtitles (ID3 USLT/SYLT + LRC + cover; optional ASR)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.28.0",
+    "requests",
+    "mutagen",
+]
+authors = [
+    {name = "Cmochance"}
+]
+
+[project.scripts]
+bilibili2mp3 = "bilibili2mp3.__main__:main"
+
+[tool.setuptools]
+packages = ["bilibili2mp3"]
+
+[tool.setuptools.package-data]
+bilibili2mp3 = ["py.typed"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

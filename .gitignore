@@ -7,7 +7,7 @@ ci-fix/
 lark-*
 
 # 本地知识库 / 生成数据(内部,不公开)
-transfer-bug-recorder/records/
+archived/transfer-bug-recorder/records/
 
 # 杂项
 .DS_Store
