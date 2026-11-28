@@ -18,12 +18,15 @@ Checked in priority order:
 
 ### Git Branch & Linked Worktree
 Checked without spawning `git` subprocesses:
-1. Explicit worktree: `worktree` or `workspace.worktree` (string or dict with `name` / `branch` / `display_name`) → marked as linked worktree.
+1. Explicit worktree: `worktree` or `workspace.worktree` (string or dict with `branch` / `name` / `display_name`) → marked as linked worktree.
 2. Walk ancestors of resolved project dir looking for `.git`:
-   - `.git` **file**: reads `gitdir: <path>`; if the resolved gitdir ends with `.../worktrees/<name>`, returns `(<name>, linked=True)`; otherwise (e.g., submodule or `--separate-git-dir`) reads `<gitdir>/HEAD` and marks as non-linked (`linked=False`).
-   - `.git` **directory** (main repo): reads `.git/HEAD` (`ref: refs/heads/<branch>` or 7-char detached SHA), falls back to `vcs.branch` → marked as main repo.
+   - `.git` **file**: reads `gitdir: <path>` and `<gitdir>/commondir`; if the resolved gitdir ends with `.../worktrees/<name>`, reads `<gitdir>/HEAD` and returns branch (`worktree.label="branch"`, default) or `<name>` (`worktree.label="name"`) with `linked=True`; otherwise (e.g., submodule or `--separate-git-dir`) reads `<gitdir>/HEAD` and marks as non-linked (`linked=False`).
+   - `.git` **directory** (main repo):
+     - **Layer 1 (`agy-worktree` session state)**: reads `<brain>/<cid>/scratch/worktree.json` (resolved from `artifactDirectoryPath`, `transcript_path`, or `session_id`/`conversation_id`). When `state == "active"`, `worktree_path` exists, and its `<gitdir>/commondir` equals the main repo's `.git`, displays the linked worktree's live branch (or git worktree name from `.git/worktrees/<name>` per `worktree.label`) in `wt_linked` color.
+     - **Layer 2 (incremental transcript probe)**: when Layer 1 is inactive and `worktree.auto_detect_from_transcript` is `true`, incrementally scans complete `\n`-terminated lines in the tail of `transcript.jsonl` past any per-file `exit_transcript_offsets` / `exit_transcript_offset` watermark scoped to the matching repo (cached by `(inode, offset, main_common)` in `scratch/wt_probe_cache.json`) for tool-call paths inside a linked worktree sharing `commondir`. Detected labels are prefixed with `worktree.auto_prefix` (default `"~"`).
+     - **Fallback**: reads `.git/HEAD` (`ref: refs/heads/<branch>` or 7-char detached SHA), falls back to `vcs.branch` → marked as main repo.
 3. Fallback: `vcs.branch`.
-- Dirty indicator: `vcs.dirty` truthy appends `*` when `worktree.show_dirty` is enabled.
+- Dirty indicator: `vcs.dirty` truthy appends `*` when `worktree.show_dirty` is enabled (suppressed when Layer 1/Layer 2 overrides a main-repo `cwd` with a separate linked worktree so main-repo status is not misattributed).
 
 ### Permission / Execution Mode
 Checked in priority order across `PERMISSION_KEYS`:

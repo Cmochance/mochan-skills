@@ -19,7 +19,10 @@
   },
   "worktree": {
     "icon": "⎇",
-    "show_dirty": true
+    "show_dirty": true,
+    "label": "branch",
+    "auto_detect_from_transcript": true,
+    "auto_prefix": "~"
   },
   "cache": {
     "icon": "⚡",

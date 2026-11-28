@@ -42,7 +42,7 @@ agy-statusline uninstall          # sets enabled=false; pass --remove to delete 
 ### Customize Style, Segments, or Thresholds
 1. If `config.local.json` does not exist yet, run `agy-statusline init-config`.
 2. Edit `config.local.json`:
-   - Supported top-level keys: `theme` (`tokyo-night` | `minimal` | `plain`), `no_color`, `separator`, `left_segments` (`path`, `worktree`), `right_segments` (`permission`, `model`, `context`, `cache`, `quota`), `path`, `worktree`, `cache` (`icon`, `style` = `percent` | `tokens` | `both`, `hide_when_empty`), `permission`, `thresholds`, `quota`, `layout`, `colors`.
+   - Supported top-level keys: `theme` (`tokyo-night` | `minimal` | `plain`), `no_color`, `separator`, `left_segments` (`path`, `worktree`), `right_segments` (`permission`, `model`, `context`, `cache`, `quota`), `path`, `worktree` (`icon`, `show_dirty`, `label` = `branch` | `name`, `auto_detect_from_transcript`, `auto_prefix`), `cache` (`icon`, `style` = `percent` | `tokens` | `both`, `hide_when_empty`), `permission`, `thresholds`, `quota`, `layout`, `colors`.
    - Valid `colors` slot keys (256-color int `0..255` or SGR ANSI string): `path`, `wt_linked`, `wt_main`, `sep`, `model`, `muted`, `green`, `amber`, `red`, `sky`, `teal`, `yellow`.
 3. Verify visually with `agy-statusline preview --scenario all` (and test `--width 60` for narrow terminals).
 

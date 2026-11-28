@@ -90,6 +90,9 @@ DEFAULT_CONFIG: dict = {
     "worktree": {
         "icon": "⎇",
         "show_dirty": True,
+        "label": "branch",
+        "auto_detect_from_transcript": True,
+        "auto_prefix": "~",
     },
     "cache": {
         "icon": "⚡",
@@ -389,65 +392,575 @@ def read_git_head(git_dir: Path) -> str:
     return clean_sha
 
 
-def detect_worktree(data: dict, current_dir: str) -> tuple[str, bool]:
-    """Return (worktree_or_branch_name, is_linked_worktree) without spawning git."""
+SESSION_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+UNQUOTED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-/])((?:/|~/)(?:\\.|[^\s'\"`\\;|<>()&:,\{\}\[\]])+)"
+    r"|(?<=-[A-Za-z])((?:/|~/)(?:\\.|[^\s'\"`\\;|<>()&:,\{\}\[\]])+)"
+)
+ABS_PATH_TOKEN_RE = re.compile(
+    r'"((?:/|~/)(?:\\.|[^"\\\r\n])+)"'
+    r"|'((?:/|~/)(?:[^'\r\n]+))'"
+    r"|(?<![A-Za-z0-9_.\-/])((?:/|~/)(?:\\.|[^\s'\"`\\;|<>()&:,\{\}\[\]])+)"
+    r"|(?<=-[A-Za-z])((?:/|~/)(?:\\.|[^\s'\"`\\;|<>()&:,\{\}\[\]])+)"
+)
+UNESCAPE_SHELL_RE = re.compile(r"\\(.)")
+TRANSCRIPT_TAIL_SCAN_BYTES = 65536
+FILE_TOOL_NAMES = frozenset(
+    {
+        "write_file",
+        "edit_file",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "read_file",
+        "view_file",
+    }
+)
+FILE_TOOL_PATH_KEYS = ("Path", "TargetFile", "path", "file_path", "target_file")
+
+
+def _safe_expanduser(raw: str | Path) -> Path:
+    return Path(os.path.expanduser(str(raw)))
+
+
+def _same_git_path(a: Path | None, b: Path | None) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        if os.path.samefile(str(a), str(b)):
+            return True
+    except (OSError, ValueError):
+        pass
+    sa, sb = str(a), str(b)
+    return sa.lower() == sb.lower() if sys.platform == "darwin" else sa == sb
+
+
+def _inspect_git_path(path: Path) -> tuple[str, str, Path | None, bool, Path | None] | None:
+    """Walk ancestors of path to inspect .git without spawning git.
+
+    Returns (branch, wt_name, common_dir, is_linked, worktree_root) or None.
+    """
+    raw_str = str(path)
+    if not raw_str or "\x00" in raw_str:
+        return None
+    try:
+        start = _safe_expanduser(raw_str).resolve()
+    except (OSError, ValueError):
+        start = _safe_expanduser(raw_str)
+
+    try:
+        candidates = (*start.parents,) if (start.is_file() or not start.exists()) else (start, *start.parents)
+    except (OSError, ValueError):
+        candidates = (*start.parents,)
+
+    for parent in candidates:
+        dot_git = parent / ".git"
+        try:
+            st = os.lstat(str(dot_git))
+        except (OSError, ValueError):
+            continue
+
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                common = dot_git.resolve()
+                root = parent.resolve()
+            except (OSError, ValueError):
+                common = dot_git
+                root = parent
+            return read_git_head(common), "", common, False, root
+
+        if stat.S_ISREG(st.st_mode):
+            try:
+                content = dot_git.read_text(encoding="utf-8").strip()
+            except Exception:
+                return "", "", None, False, parent
+            gitdir_raw = ""
+            for line in content.splitlines():
+                if line.lower().startswith("gitdir:"):
+                    gitdir_raw = line.split(":", 1)[1].strip()
+                    break
+            if not gitdir_raw or "\x00" in gitdir_raw:
+                return "", "", None, False, parent
+            try:
+                gitdir_path = _safe_expanduser(gitdir_raw)
+                if not gitdir_path.is_absolute():
+                    gitdir_path = (parent / gitdir_path).resolve()
+                else:
+                    gitdir_path = gitdir_path.resolve()
+            except Exception:
+                return "", "", None, False, parent
+
+            parts = gitdir_path.parts
+            common_dir = gitdir_path
+            try:
+                cd_raw = (gitdir_path / "commondir").read_text(encoding="utf-8").strip()
+                if cd_raw and "\x00" not in cd_raw:
+                    cd_path = _safe_expanduser(cd_raw)
+                    common_dir = (gitdir_path / cd_path).resolve() if not cd_path.is_absolute() else cd_path.resolve()
+            except Exception:
+                if len(parts) >= 3 and parts[-2] == "worktrees" and parts[-3] == ".git":
+                    try:
+                        common_dir = gitdir_path.parent.parent.resolve()
+                    except (OSError, ValueError):
+                        common_dir = gitdir_path.parent.parent
+
+            branch = read_git_head(gitdir_path)
+            try:
+                root = parent.resolve()
+            except (OSError, ValueError):
+                root = parent
+            if len(parts) >= 2 and parts[-2] == "worktrees":
+                return branch, _sanitize_single_line(parts[-1]), common_dir, True, root
+            return branch, "", common_dir, False, root
+
+    return None
+
+
+def _format_linked_label(branch: str, wt_name: str, label_mode: str) -> str:
+    if label_mode == "name":
+        return _sanitize_single_line(wt_name or branch)
+    return _sanitize_single_line(branch or wt_name)
+
+
+def _select_preferred_transcript(logs_dir: Path, fallback: Path | None = None) -> Path:
+    """Prefer compact transcript.jsonl only when non-empty and fresh relative to transcript_full.jsonl."""
+    compact = logs_dir / "transcript.jsonl"
+    full = logs_dir / "transcript_full.jsonl"
+    try:
+        st_c = compact.stat()
+    except (OSError, ValueError):
+        st_c = None
+    try:
+        st_f = full.stat()
+    except (OSError, ValueError):
+        st_f = None
+
+    if st_c is not None and st_c.st_size > 0:
+        if st_f is None or st_c.st_mtime >= st_f.st_mtime - 5.0:
+            return compact
+    if st_f is not None and st_f.st_size > 0:
+        return full
+    if fallback is not None:
+        return fallback
+    return compact
+
+
+def _extract_session_paths(data: dict, data_dir: Path | None) -> tuple[Path | None, Path | None]:
+    """Resolve (scratch_dir, transcript_path) for the active agy conversation."""
+    scratch_dir: Path | None = None
+    transcript_path: Path | None = None
+
+    for k in ("artifactDirectoryPath", "artifact_directory_path"):
+        raw_art = data.get(k)
+        if isinstance(raw_art, str) and raw_art.strip() and "\x00" not in raw_art:
+            art_p = _safe_expanduser(raw_art.strip())
+            if art_p.parent.name == "brain":
+                scratch_dir = art_p / "scratch"
+                transcript_path = _select_preferred_transcript(art_p / ".system_generated" / "logs")
+                break
+            if art_p.name == "artifacts" and art_p.parent.parent.name == "brain":
+                scratch_dir = art_p.parent / "scratch"
+                transcript_path = _select_preferred_transcript(art_p.parent / ".system_generated" / "logs")
+                break
+
+    raw_tp = data.get("transcript_path") or data.get("transcriptPath")
+    if isinstance(raw_tp, str) and raw_tp.strip() and "\x00" not in raw_tp:
+        tp = _safe_expanduser(raw_tp.strip())
+        if tp.name in ("transcript_full.jsonl", "transcript.jsonl"):
+            tp = _select_preferred_transcript(tp.parent, fallback=tp)
+        transcript_path = tp
+        if scratch_dir is None and tp.parent.name == "logs" and tp.parent.parent.name == ".system_generated":
+            scratch_dir = tp.parent.parent.parent / "scratch"
+
+    cid = ""
+    for k in ("session_id", "conversation_id", "conversationId"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            cid = v.strip()
+            break
+    if cid and SESSION_ID_SAFE_RE.fullmatch(cid):
+        d = data_dir if data_dir is not None else default_data_dir()
+        brain_conv = d / "brain" / cid
+        if scratch_dir is None:
+            scratch_dir = brain_conv / "scratch"
+        if transcript_path is None:
+            transcript_path = _select_preferred_transcript(brain_conv / ".system_generated" / "logs")
+
+    return scratch_dir, transcript_path
+
+
+def _resolve_exit_watermark(parsed: dict, transcript_path: Path | None) -> int:
+    """Resolve the byte-offset watermark matching the exact transcript filename being scanned."""
+    offsets_map = parsed.get("exit_transcript_offsets")
+    tp_name = transcript_path.name if transcript_path is not None else ""
+    if isinstance(offsets_map, dict) and offsets_map:
+        if tp_name and tp_name in offsets_map:
+            val = offsets_map.get(tp_name)
+            if is_num(val) and float(val) >= 0:
+                return int(val)
+        return 0
+    raw_offset = parsed.get("exit_transcript_offset")
+    if is_num(raw_offset) and float(raw_offset) >= 0:
+        return int(raw_offset)
+    return 0
+
+
+def _load_session_worktree(
+    scratch_dir: Path | None,
+    main_common: Path,
+    label_mode: str,
+    transcript_path: Path | None = None,
+) -> tuple[str | None, int]:
+    """Read Layer 1 scratch/worktree.json. Returns (active_label_or_None, exit_transcript_offset)."""
+    if scratch_dir is None:
+        return None, 0
+    state_path = scratch_dir / "worktree.json"
+    try:
+        parsed = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, 0
+    if not isinstance(parsed, dict):
+        return None, 0
+
+    state = str(parsed.get("state") or "").strip().lower()
+    if state != "active":
+        raw_cd = parsed.get("common_dir")
+        if isinstance(raw_cd, str) and raw_cd.strip() and "\x00" not in raw_cd:
+            try:
+                st_common = _safe_expanduser(raw_cd).resolve()
+            except (OSError, ValueError):
+                st_common = _safe_expanduser(raw_cd)
+            if not _same_git_path(st_common, main_common):
+                return None, 0
+        return None, _resolve_exit_watermark(parsed, transcript_path)
+
+    wt_path_raw = parsed.get("worktree_path")
+    if not isinstance(wt_path_raw, str) or not wt_path_raw.strip() or "\x00" in wt_path_raw:
+        return None, 0
+    wt_path = _safe_expanduser(wt_path_raw)
+    try:
+        if not wt_path.is_dir():
+            return None, 0
+    except (OSError, ValueError):
+        return None, 0
+
+    info = _inspect_git_path(wt_path)
+    if info is None:
+        return None, 0
+    branch, wt_name, wt_common, is_linked, _ = info
+    if not is_linked or not _same_git_path(wt_common, main_common):
+        return None, 0
+
+    label = _format_linked_label(
+        branch or _sanitize_single_line(str(parsed.get("branch") or "")),
+        wt_name or _sanitize_single_line(str(parsed.get("worktree_name") or "")),
+        label_mode,
+    )
+    return (label or None), 0
+
+
+def _unwrap_transcript_arg(val: object) -> str:
+    """Unwrap plain or double-JSON-encoded string arguments from transcript.jsonl."""
+    if not isinstance(val, str):
+        return ""
+    s = val.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        try:
+            decoded = json.loads(s)
+            if isinstance(decoded, str):
+                return decoded.strip()
+        except Exception:
+            pass
+    return s
+
+
+def _extract_candidate_paths_from_tool_call(tc: object) -> list[str]:
+    """Extract filesystem path candidates from a single transcript tool_call object."""
+    if not isinstance(tc, dict):
+        return []
+    name = str(tc.get("name") or "").strip().lower()
+    args = tc.get("args")
+    if not isinstance(args, dict):
+        return []
+
+    paths: list[str] = []
+    if name in FILE_TOOL_NAMES:
+        for k in FILE_TOOL_PATH_KEYS:
+            p = _unwrap_transcript_arg(args.get(k))
+            if p and "\x00" not in p and (p.startswith("/") or p.startswith("~/")):
+                paths.append(p)
+                break
+        return paths
+
+    if name == "run_command":
+        raw_cmd = args.get("CommandLine") or args.get("command")
+        cmd = _unwrap_transcript_arg(raw_cmd)
+        if cmd and "\x00" not in cmd:
+            if (cmd.startswith("/") or cmd.startswith("~/")) and " " in cmd:
+                paths.append(cmd)
+            for m in ABS_PATH_TOKEN_RE.finditer(cmd):
+                if m.group(1) is not None:
+                    cand = m.group(1).replace('\\"', '"').replace("\\\\", "\\").rstrip("\\").strip()
+                    if cand and len(cand) > 1:
+                        paths.append(cand)
+                        # If a double-quoted compound command starts with '/', also scan its interior for paths
+                        if " " in cand and ("/" in cand[1:] or "~/" in cand):
+                            for inner in UNQUOTED_PATH_RE.finditer(cand):
+                                ic = UNESCAPE_SHELL_RE.sub(r"\1", inner.group(1) or inner.group(2) or "").strip()
+                                if ic and len(ic) > 1:
+                                    paths.append(ic)
+                elif m.group(2) is not None:
+                    cand = m.group(2).strip()
+                    if cand and len(cand) > 1:
+                        paths.append(cand)
+                        if " " in cand and ("/" in cand[1:] or "~/" in cand):
+                            for inner in UNQUOTED_PATH_RE.finditer(cand):
+                                ic = UNESCAPE_SHELL_RE.sub(r"\1", inner.group(1) or inner.group(2) or "").strip()
+                                if ic and len(ic) > 1:
+                                    paths.append(ic)
+                else:
+                    cand = UNESCAPE_SHELL_RE.sub(r"\1", m.group(3) or m.group(4) or "").strip()
+                    if cand and len(cand) > 1:
+                        paths.append(cand)
+        return paths
+
+    return paths
+
+
+def _match_same_repo_linked_worktree(cand_raw: str, main_common: Path) -> tuple[str, str, Path] | None:
+    """If cand_raw points inside a linked worktree sharing main_common, return (branch, wt_name, wt_root)."""
+    if not cand_raw or "\x00" in cand_raw:
+        return None
+    try:
+        cand = _safe_expanduser(cand_raw)
+        if not cand.is_absolute():
+            return None
+        info = _inspect_git_path(cand)
+        if info is None:
+            return None
+        branch, wt_name, wt_common, is_linked, wt_root = info
+        if is_linked and _same_git_path(wt_common, main_common) and wt_root is not None and wt_root.is_dir():
+            return branch, wt_name, wt_root
+    except Exception:
+        return None
+    return None
+
+
+def _probe_worktree_from_transcript(
+    scratch_dir: Path | None,
+    transcript_path: Path | None,
+    main_common: Path,
+    exit_watermark: int,
+    label_mode: str,
+) -> str | None:
+    """Layer 2: incrementally scan complete JSONL lines in transcript tail for same-repo linked worktrees."""
+    if transcript_path is None or "\x00" in str(transcript_path):
+        return None
+    try:
+        st = transcript_path.stat()
+    except (OSError, ValueError):
+        return None
+
+    size = st.st_size
+    inode = st.st_ino
+    if size <= exit_watermark:
+        return None
+
+    cache_path = scratch_dir / "wt_probe_cache.json" if scratch_dir is not None else None
+    cached: dict | None = None
+    if cache_path is not None:
+        try:
+            raw_c = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(raw_c, dict):
+                cached = raw_c
+        except Exception:
+            cached = None
+
+    main_common_str = str(main_common)
+    same_stream = (
+        cached is not None
+        and cached.get("inode") == inode
+        and cached.get("main_common") == main_common_str
+        and cached.get("exit_watermark") == exit_watermark
+        and isinstance(cached.get("offset"), int)
+        and 0 <= cached["offset"] <= size
+    )
+
+    if same_stream and cached is not None and cached["offset"] == size:
+        cached_wt = str(cached.get("worktree_path") or "")
+        if not cached_wt:
+            return None
+        matched = _match_same_repo_linked_worktree(cached_wt, main_common)
+        if matched is None:
+            try:
+                if cache_path is not None:
+                    _atomic_write_private(
+                        cache_path,
+                        json.dumps(
+                            {
+                                "inode": inode,
+                                "offset": size,
+                                "main_common": main_common_str,
+                                "exit_watermark": exit_watermark,
+                                "worktree_path": "",
+                            }
+                        ),
+                    )
+            except Exception:
+                pass
+            return None
+        branch, wt_name, _ = matched
+        return _format_linked_label(branch, wt_name, label_mode) or None
+
+    prev_offset = cached["offset"] if (same_stream and cached is not None) else exit_watermark
+    seek_start = max(exit_watermark, prev_offset, size - TRANSCRIPT_TAIL_SCAN_BYTES)
+    mid_line = False
+    try:
+        with open(transcript_path, "rb") as fp:
+            if seek_start > 0:
+                fp.seek(seek_start - 1)
+                mid_line = fp.read(1) != b"\n"
+            raw_chunk = fp.read(size - seek_start)
+    except (OSError, ValueError):
+        return None
+
+    # Only advance cached offset through the last complete newline so partial mid-write JSONL lines are never skipped
+    last_nl = raw_chunk.rfind(b"\n")
+    if last_nl >= 0:
+        next_offset = seek_start + last_nl + 1
+        chunk = raw_chunk[:last_nl]
+    else:
+        # No complete line yet in delta: hold prev_offset unless a single unterminated line exceeds the scan window
+        next_offset = prev_offset if (size - prev_offset) <= TRANSCRIPT_TAIL_SCAN_BYTES else size
+        chunk = b""
+
+    if mid_line and chunk:
+        first_nl = chunk.find(b"\n")
+        chunk = chunk[first_nl + 1 :] if first_nl >= 0 else b""
+
+    detected: tuple[str, str, Path] | None = None
+    if chunk:
+        for raw_line in reversed(chunk.splitlines()):
+            if b"tool_calls" not in raw_line:
+                continue
+            try:
+                entry = json.loads(raw_line.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            tool_calls = entry.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tc in reversed(tool_calls):
+                for cand in reversed(_extract_candidate_paths_from_tool_call(tc)):
+                    matched = _match_same_repo_linked_worktree(cand, main_common)
+                    if matched is not None:
+                        detected = matched
+                        break
+                if detected is not None:
+                    break
+            if detected is not None:
+                break
+
+    if detected is None and same_stream and cached is not None:
+        prev_wt = str(cached.get("worktree_path") or "")
+        if prev_wt:
+            detected = _match_same_repo_linked_worktree(prev_wt, main_common)
+
+    if cache_path is not None:
+        try:
+            _atomic_write_private(
+                cache_path,
+                json.dumps(
+                    {
+                        "inode": inode,
+                        "offset": next_offset,
+                        "main_common": main_common_str,
+                        "exit_watermark": exit_watermark,
+                        "worktree_path": str(detected[2]) if detected is not None else "",
+                    }
+                ),
+            )
+        except Exception:
+            pass
+
+    if detected is None:
+        return None
+    branch, wt_name, _ = detected
+    return _format_linked_label(branch, wt_name, label_mode) or None
+
+
+def detect_worktree_detail(
+    data: dict,
+    current_dir: str,
+    *,
+    cfg: dict | None = None,
+    data_dir: Path | None = None,
+) -> tuple[str, bool, bool, bool]:
+    """Return (label, is_linked, is_auto_detected, is_session_override) without spawning git."""
+    wt_cfg = cfg.get("worktree") if isinstance(cfg, dict) and isinstance(cfg.get("worktree"), dict) else {}
+    label_mode = str(wt_cfg.get("label") or "branch").strip().lower()
+    auto_detect = bool(wt_cfg.get("auto_detect_from_transcript", True))
+
     ws = data.get("workspace")
-    explicit = extract_str(data.get("worktree"), ("name", "branch", "display_name"))
+    explicit = extract_str(data.get("worktree"), ("branch", "name", "display_name") if label_mode != "name" else ("name", "branch", "display_name"))
     if not explicit and isinstance(ws, dict):
-        explicit = extract_str(ws.get("worktree"), ("name", "branch", "display_name"))
+        explicit = extract_str(ws.get("worktree"), ("branch", "name", "display_name") if label_mode != "name" else ("name", "branch", "display_name"))
     if explicit:
-        return explicit, True
+        return explicit, True, False, False
 
     vcs = data.get("vcs") if isinstance(data.get("vcs"), dict) else {}
     vcs_branch = extract_str(vcs.get("branch"))
 
-    if current_dir:
-        try:
-            start = Path(current_dir).expanduser().resolve()
-        except Exception:
-            start = Path(current_dir).expanduser()
+    if current_dir and "\x00" not in current_dir:
+        info = _inspect_git_path(Path(current_dir))
+        if info is not None:
+            branch, wt_name, common_dir, is_linked, root = info
+            if is_linked:
+                return _format_linked_label(branch, wt_name, label_mode), True, False, False
 
-        for parent in (start, *start.parents):
-            dot_git = parent / ".git"
-            try:
-                if not dot_git.exists():
-                    continue
-                is_file = dot_git.is_file()
-                is_dir = dot_git.is_dir()
-            except OSError:
-                continue
+            # Current directory is a main repository: check Layer 1 (worktree.json) then Layer 2 (transcript)
+            if common_dir is not None:
+                scratch_dir, transcript_path = _extract_session_paths(data, data_dir)
+                layer1_label, exit_watermark = _load_session_worktree(
+                    scratch_dir, common_dir, label_mode, transcript_path
+                )
+                if layer1_label:
+                    return layer1_label, True, False, True
+                if auto_detect:
+                    layer2_label = _probe_worktree_from_transcript(
+                        scratch_dir,
+                        transcript_path,
+                        common_dir,
+                        exit_watermark,
+                        label_mode,
+                    )
+                    if layer2_label:
+                        return layer2_label, True, True, True
 
-            if is_file:
-                try:
-                    content = dot_git.read_text(encoding="utf-8").strip()
-                except Exception:
-                    return _sanitize_single_line(parent.name), False
-                gitdir_raw = ""
-                for line in content.splitlines():
-                    if line.lower().startswith("gitdir:"):
-                        gitdir_raw = line.split(":", 1)[1].strip()
-                        break
-                if gitdir_raw:
-                    try:
-                        gitdir_path = Path(gitdir_raw).expanduser()
-                        if not gitdir_path.is_absolute():
-                            gitdir_path = (parent / gitdir_path).resolve()
-                        parts = gitdir_path.parts
-                        if len(parts) >= 2 and parts[-2] == "worktrees":
-                            return _sanitize_single_line(parts[-1]), True
-                        branch = read_git_head(gitdir_path)
-                        return (branch or vcs_branch or _sanitize_single_line(parent.name)), False
-                    except Exception:
-                        return (vcs_branch or _sanitize_single_line(parent.name)), False
-                return (vcs_branch or _sanitize_single_line(parent.name)), False
-
-            if is_dir:
-                branch = read_git_head(dot_git) or vcs_branch
-                return branch, False
+            if branch:
+                return branch, False, False, False
+            if vcs_branch:
+                return vcs_branch, False, False, False
+            if root is not None and common_dir is None:
+                return _sanitize_single_line(root.name), False, False, False
 
     if vcs_branch:
-        return vcs_branch, False
-    return "", False
+        return vcs_branch, False, False, False
+    return "", False, False, False
+
+
+def detect_worktree(
+    data: dict,
+    current_dir: str,
+    *,
+    cfg: dict | None = None,
+    data_dir: Path | None = None,
+) -> tuple[str, bool]:
+    """Return (worktree_or_branch_name, is_linked_worktree) without spawning git."""
+    label, is_linked, _, _ = detect_worktree_detail(data, current_dir, cfg=cfg, data_dir=data_dir)
+    return label, is_linked
 
 
 def shorten_path(path_text: str, max_w: int, abbreviate_parents: bool = True) -> str:
@@ -913,6 +1426,7 @@ def _build_left(
     cfg: dict,
     pal: dict[str, str],
     avail_left: int,
+    data_dir: Path | None = None,
 ) -> str:
     """Build the responsive left-hand segment string strictly within avail_left."""
     if avail_left <= 0:
@@ -943,9 +1457,15 @@ def _build_left(
     wt_prefix_w = display_width(wt_prefix)
 
     if show_wt:
-        wt_name, is_linked = detect_worktree(data, raw_dir)
+        wt_name, is_linked, is_auto, is_override = detect_worktree_detail(
+            data, raw_dir, cfg=cfg, data_dir=data_dir
+        )
+        if wt_name and is_auto:
+            raw_auto_pfx = wt_cfg.get("auto_prefix", "~")
+            auto_pfx = _sanitize_single_line(raw_auto_pfx, strip=False) if isinstance(raw_auto_pfx, str) else "~"
+            wt_name = f"{auto_pfx}{wt_name}"
         vcs = data.get("vcs") if isinstance(data.get("vcs"), dict) else {}
-        if bool(wt_cfg.get("show_dirty", True)) and vcs.get("dirty"):
+        if bool(wt_cfg.get("show_dirty", True)) and not is_override and vcs.get("dirty"):
             dirty_suffix = "*"
         wt_color = pal["wt_linked"] if is_linked else pal["wt_main"]
 
@@ -1090,7 +1610,7 @@ def render(
             avail_left = 1
     else:
         avail_left = target_width
-    left = _build_left(data, cfg, pal, avail_left)
+    left = _build_left(data, cfg, pal, avail_left, data_dir=data_dir)
 
     if not left and not right:
         return ""

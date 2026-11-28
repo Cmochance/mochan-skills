@@ -1,0 +1,1417 @@
+#!/usr/bin/env python3
+"""agy-wt: Antigravity CLI worktree lifecycle manager (enter, exit, close, status, list, strict, init-config, doctor)."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import wt_common as wt  # noqa: E402
+
+LSREGISTER_PATH = Path(
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run_git(repo_dir: Path, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        text=True,
+        capture_output=True,
+        check=check,
+    )
+
+
+def _require_config() -> dict[str, Any]:
+    cfg, err = wt.load_config_checked()
+    if err:
+        raise RuntimeError(err)
+    return cfg
+
+
+def _git_has_remote(main_root: Path, remote: str = "origin") -> bool:
+    proc = _run_git(main_root, ["remote", "get-url", remote])
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def _detect_base_branch(main_root: Path, repo_cfg: dict[str, Any], explicit_base: str | None) -> str:
+    if explicit_base and explicit_base.strip():
+        return explicit_base.strip()
+    configured = str(repo_cfg.get("default_base_branch") or "auto").strip()
+    if configured and configured.lower() != "auto":
+        return configured
+
+    proc = _run_git(main_root, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    if proc.returncode == 0 and proc.stdout.strip():
+        val = proc.stdout.strip()
+        if val.startswith("origin/"):
+            return val[len("origin/") :]
+        return val
+
+    for cand in ("main", "master"):
+        p = _run_git(main_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{cand}"])
+        if p.returncode == 0:
+            return cand
+
+    cur = wt.read_git_head(main_root / ".git")
+    return cur or "main"
+
+
+def _parse_worktree_list(main_root: Path) -> list[dict[str, Any]]:
+    proc = _run_git(main_root, ["worktree", "list", "--porcelain"])
+    if proc.returncode != 0:
+        raise RuntimeError(f"`git worktree list --porcelain` failed in {main_root}: {proc.stderr.strip()}")
+    entries: list[dict[str, Any]] = []
+    cur: dict[str, Any] = {}
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            if cur:
+                entries.append(cur)
+                cur = {}
+            continue
+        if line.startswith("worktree "):
+            if cur:
+                entries.append(cur)
+                cur = {}
+            cur["path"] = str(wt.resolve_path_safe(line[len("worktree ") :].strip()))
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD ") :].strip()
+        elif line.startswith("branch "):
+            ref = line[len("branch ") :].strip()
+            prefix = "refs/heads/"
+            cur["branch"] = ref[len(prefix) :] if ref.startswith(prefix) else ref
+        elif line == "bare":
+            cur["bare"] = True
+        elif line == "detached":
+            cur["detached"] = True
+        elif line.startswith("prunable"):
+            cur["prunable"] = True
+    if cur:
+        entries.append(cur)
+    for e in entries:
+        e["is_main"] = wt.same_resolved_path(e.get("path", ""), main_root)
+    return entries
+
+
+def _resolve_brain_dir(
+    main_root: Path,
+    session_arg: str | None = None,
+    brain_dir_arg: str | None = None,
+    *,
+    consume_hint: bool = False,
+) -> tuple[Path | None, Path | None, str]:
+    """Resolve (brain_dir, transcript_path, source_label) for state persistence.
+
+    Precedence: --brain-dir > --session > AGY_CONVERSATION_ID/AGY_SESSION_ID > PreToolUse hint.
+    """
+    if brain_dir_arg:
+        bd = wt.normalize_brain_dir(wt.resolve_path_safe(brain_dir_arg))
+        tp = bd / ".system_generated" / "logs" / "transcript.jsonl"
+        return bd, tp, "flag:--brain-dir"
+
+    cid = (
+        (session_arg or "").strip()
+        or os.environ.get("AGY_CONVERSATION_ID", "").strip()
+        or os.environ.get("AGY_SESSION_ID", "").strip()
+    )
+    if cid:
+        if not wt.is_safe_session_id(cid):
+            raise ValueError(f"Invalid session ID: {cid!r}")
+        bd = wt.default_data_dir() / "brain" / cid
+        tp = bd / ".system_generated" / "logs" / "transcript.jsonl"
+        return bd, tp, "session-id"
+
+    hint = wt.read_session_hint(main_root, consume=consume_hint)
+    if hint:
+        bd_str = str(hint.get("brain_dir") or "").strip()
+        tp_str = str(hint.get("transcript_path") or "").strip()
+        if bd_str:
+            bd = wt.normalize_brain_dir(Path(bd_str).expanduser())
+            tp = Path(tp_str).expanduser() if tp_str else bd / ".system_generated" / "logs" / "transcript.jsonl"
+            return bd, tp, "hook-hint"
+        hcid = str(hint.get("conversation_id") or "").strip()
+        if wt.is_safe_session_id(hcid):
+            bd = wt.default_data_dir() / "brain" / hcid
+            tp = Path(tp_str).expanduser() if tp_str else bd / ".system_generated" / "logs" / "transcript.jsonl"
+            return bd, tp, "hook-hint"
+
+    return None, None, "none"
+
+
+NESTED_CACHE_SAFE_DIRS = frozenset({"__pycache__", ".pytest_cache", "node_modules"})
+
+
+def _inspect_worktree_status(wt_path: Path, safe_ignored_dirs: list[str]) -> dict[str, list[str]]:
+    """Inspect dirty, untracked, safe-ignored, and unsafe-ignored files using git status -z."""
+    proc = _run_git(wt_path, ["status", "-z", "--porcelain=v1", "--ignored=matching", "--untracked-files=all"])
+    if proc.returncode != 0:
+        raise RuntimeError(f"git status failed in {wt_path}: {proc.stderr.strip()}")
+
+    norm_safe = [wt.strip_rel_prefix(d).rstrip("/") for d in safe_ignored_dirs if isinstance(d, str) and d.strip()]
+    dirty: list[str] = []
+    untracked: list[str] = []
+    ignored_safe: list[str] = []
+    ignored_unsafe: list[str] = []
+
+    tokens = proc.stdout.split("\x00")
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if not entry or len(entry) < 4:
+            continue
+        code = entry[:2]
+        path_part = entry[3:]
+        if code[0] in ("R", "C") or code[1] in ("R", "C"):
+            i += 1
+
+        is_dir = path_part.endswith("/")
+        clean_rel = wt.strip_rel_prefix(path_part).rstrip("/")
+        if code == "??":
+            untracked.append(path_part)
+        elif code == "!!":
+            rel_parts = clean_rel.split("/")
+            dir_parts = rel_parts if is_dir else rel_parts[:-1]
+            is_safe = False
+            for sd in norm_safe:
+                if not sd:
+                    continue
+                if sd.startswith("**/"):
+                    nested_name = sd[3:].strip("/")
+                    if nested_name and nested_name in dir_parts:
+                        is_safe = True
+                        break
+                    continue
+                if (is_dir and clean_rel == sd) or clean_rel.startswith(sd + "/"):
+                    is_safe = True
+                    break
+                # Only unambiguous cache dirs (not generic build/dist/target) match at nested depth
+                if sd in NESTED_CACHE_SAFE_DIRS and sd in dir_parts:
+                    is_safe = True
+                    break
+            if is_safe:
+                ignored_safe.append(path_part)
+            else:
+                ignored_unsafe.append(path_part)
+        else:
+            dirty.append(f"{code} {path_part}")
+
+    return {
+        "dirty": dirty,
+        "untracked": untracked,
+        "ignored_safe": ignored_safe,
+        "ignored_unsafe": ignored_unsafe,
+    }
+
+
+def _find_macos_app_bundles(wt_path: Path) -> list[Path]:
+    """Find non-symlink *.app bundles strictly inside build/ and dist/ of a worktree."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    norm_wt = wt.resolve_path_safe(wt_path)
+    for sub in ("build", "dist"):
+        root = norm_wt / sub
+        try:
+            if root.is_symlink() or not root.is_dir():
+                continue
+        except OSError:
+            continue
+        for cur_root, dirs, _ in os.walk(str(root), followlinks=False):
+            for dname in list(dirs):
+                cand = Path(cur_root) / dname
+                try:
+                    if cand.is_symlink():
+                        dirs.remove(dname)
+                        continue
+                except OSError:
+                    dirs.remove(dname)
+                    continue
+                if dname.endswith(".app"):
+                    app_p = wt.resolve_path_safe(cand)
+                    if wt.is_path_within(app_p, norm_wt):
+                        key = str(app_p)
+                        if key not in seen:
+                            seen.add(key)
+                            found.append(app_p)
+                    dirs.remove(dname)
+    return found
+
+
+def _ancestor_pids(pid_to_ppid: dict[int, int], start_pid: int) -> set[int]:
+    anc: set[int] = {start_pid}
+    cur = start_pid
+    for _ in range(64):
+        parent = pid_to_ppid.get(cur)
+        if not parent or parent <= 1 or parent in anc:
+            break
+        anc.add(parent)
+        cur = parent
+    return anc
+
+
+def _cleanup_macos_app_bundles(wt_path: Path, mode: Any) -> list[str]:
+    """Terminate running apps whose executable lives strictly inside wt_path's .app and unregister LaunchServices."""
+    notes: list[str] = []
+    if mode is False or str(mode).lower() == "false":
+        return notes
+    if sys.platform != "darwin" and mode is not True and str(mode).lower() != "true":
+        return notes
+
+    apps = _find_macos_app_bundles(wt_path)
+    if not apps:
+        return notes
+
+    # Collect (pid, ppid, executable_path) safely with -ww unlimited width (avoids 80-col PTY truncation)
+    procs: list[tuple[int, int, str]] = []
+    pid_to_ppid: dict[int, int] = {}
+    try:
+        ps = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,comm="],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        if ps.returncode == 0:
+            for line in ps.stdout.splitlines():
+                parts = line.strip().split(None, 2)
+                if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                    pid, ppid, comm = int(parts[0]), int(parts[1]), parts[2].strip()
+                    procs.append((pid, ppid, comm))
+                    pid_to_ppid[pid] = ppid
+        else:
+            print(f"Warning: ps failed (rc={ps.returncode}) while inspecting worktree apps: {ps.stderr.strip()}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Warning: could not inspect running processes via ps: {exc}", file=sys.stderr)
+
+    protected_pids = _ancestor_pids(pid_to_ppid, os.getpid())
+
+    for app_path in apps:
+        app_str = str(app_path)
+        exe_prefix = f"{app_str}/"
+        matched_pids: list[int] = []
+        for pid, _, comm in procs:
+            if pid in protected_pids:
+                continue
+            if comm.startswith(exe_prefix):
+                matched_pids.append(pid)
+
+        sent_pids: list[int] = []
+        for pid in matched_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                sent_pids.append(pid)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                print(f"Warning: failed to terminate PID {pid} ({app_path.name}): {exc}", file=sys.stderr)
+
+        if sent_pids:
+            deadline = time.monotonic() + 1.0
+            alive = set(sent_pids)
+            while alive and time.monotonic() < deadline:
+                time.sleep(0.1)
+                for pid in list(alive):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        alive.discard(pid)
+                    except PermissionError:
+                        alive.discard(pid)
+            for pid in sent_pids:
+                status_txt = "terminated" if pid not in alive else "still running after SIGTERM"
+                notes.append(f"Worktree app PID {pid} ({app_path.name}): {status_txt}")
+                if pid in alive:
+                    print(f"Warning: worktree app PID {pid} ({app_path.name}) did not exit within 1s", file=sys.stderr)
+
+        if LSREGISTER_PATH.is_file():
+            try:
+                ls = subprocess.run(
+                    [str(LSREGISTER_PATH), "-u", app_str],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                if ls.returncode == 0:
+                    notes.append(f"Unregistered LaunchServices entry: {app_path}")
+                else:
+                    msg = f"lsregister -u failed (rc={ls.returncode}) for {app_path}: {ls.stderr.strip()}"
+                    print(f"Warning: {msg}", file=sys.stderr)
+                    notes.append(msg)
+            except Exception as exc:
+                msg = f"lsregister -u skipped for {app_path}: {exc}"
+                print(f"Warning: {msg}", file=sys.stderr)
+                notes.append(msg)
+        elif sys.platform == "darwin":
+            print(f"Warning: lsregister not found at {LSREGISTER_PATH}; skipping unregister for {app_path}", file=sys.stderr)
+    return notes
+
+
+def _require_repo(repo_arg: str | None) -> dict[str, Any]:
+    target = wt.resolve_path_safe(repo_arg) if repo_arg else wt.resolve_path_safe(os.getcwd())
+    repo = wt.find_git_repo_info(target)
+    if repo is None:
+        raise RuntimeError(f"Not inside a git repository: {target}")
+    return repo
+
+
+def _mark_session_exited(
+    state_path: Path | None,
+    cur_state: dict[str, Any] | None,
+    main_root: Path,
+    common_dir: Path,
+    brain_dir: Path | None,
+    transcript_path: Path | None,
+) -> tuple[int, dict[str, int]]:
+    compat_offset, offsets = wt.read_transcript_offsets(brain_dir, transcript_path)
+    if state_path is not None:
+        next_state = (
+            dict(cur_state)
+            if (cur_state and wt.same_resolved_path(cur_state.get("main_dir", ""), main_root))
+            else {"version": 1, "main_dir": str(main_root), "common_dir": str(common_dir)}
+        )
+        next_state["state"] = "exited"
+        next_state["exited_at"] = _now_iso()
+        next_state["exit_transcript_offset"] = compat_offset
+        next_state["exit_transcript_offsets"] = offsets
+        wt.atomic_write_private(state_path, json.dumps(next_state, indent=2, ensure_ascii=False) + "\n")
+    return compat_offset, offsets
+
+
+def cmd_enter(args: argparse.Namespace) -> int:
+    repo = _require_repo(args.repo)
+    main_root: Path = repo["main_root"]
+    common_dir: Path = repo["common_dir"]
+    cfg = _require_config()
+    repo_cfg = wt.resolve_repo_config(cfg, main_root)
+
+    branch = args.branch.strip()
+    ref_chk = _run_git(main_root, ["check-ref-format", "--branch", branch])
+    if ref_chk.returncode != 0:
+        print(f"Error: invalid git branch name: {branch!r}", file=sys.stderr)
+        return 1
+
+    base_branch = _detect_base_branch(main_root, repo_cfg, args.base)
+    main_cur_branch = wt.read_git_head(common_dir)
+    if branch == main_cur_branch:
+        print(
+            f"Error: branch '{branch}' is already checked out in main repository '{main_root}'. "
+            "Use a feature/fix branch name for the linked worktree.",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing_wts = _parse_worktree_list(main_root)
+    existing_match = next(
+        (w for w in existing_wts if not w.get("is_main") and w.get("branch") == branch),
+        None,
+    )
+
+    created_new = False
+    post_create_logs: list[str] = []
+
+    if existing_match is not None:
+        wt_path = Path(existing_match["path"])
+        if existing_match.get("prunable") or not wt_path.is_dir():
+            print(
+                f"Error: worktree for branch '{branch}' at '{wt_path}' is missing/prunable. "
+                f"Run `git -C '{main_root}' worktree prune` first, then re-run `agy-wt enter {branch}`.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        if args.existing:
+            print(f"Error: no existing worktree found for branch '{branch}'.", file=sys.stderr)
+            return 1
+
+        wt_path = (
+            wt.resolve_path_safe(args.path, base_dir=main_root)
+            if args.path
+            else wt.render_worktree_path(main_root, branch, repo_cfg)
+        )
+        if wt.is_path_within(wt_path, main_root) or wt.is_path_within(main_root, wt_path):
+            print(
+                f"Error: worktree path '{wt_path}' must not overlap or nest inside main repository '{main_root}'.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if wt_path.exists():
+            reg_match = next((w for w in existing_wts if wt.same_resolved_path(w.get("path", ""), wt_path)), None)
+            if reg_match is None or reg_match.get("is_main"):
+                print(
+                    f"Error: target path already exists and is not a registered worktree: {wt_path}",
+                    file=sys.stderr,
+                )
+                return 1
+            if reg_match.get("branch") != branch:
+                print(
+                    f"Error: target path '{wt_path}' is already a worktree for branch '{reg_match.get('branch')}', "
+                    f"not '{branch}'. Pass an explicit --path to avoid slug collision.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            if repo_cfg.get("enter", {}).get("auto_pull_main", True) and not args.no_pull:
+                if _git_has_remote(main_root):
+                    pull_proc = _run_git(main_root, ["pull", "--ff-only"])
+                    if pull_proc.returncode != 0:
+                        print(
+                            f"Error: `git pull --ff-only` failed in main repo '{main_root}':\n{pull_proc.stderr.strip()}",
+                            file=sys.stderr,
+                        )
+                        return 1
+
+            wt_path.parent.mkdir(parents=True, exist_ok=True)
+            local_exists = _run_git(main_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0
+            remote_exists = (
+                _run_git(main_root, ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"]).returncode == 0
+            )
+            created_branch = not local_exists
+            if local_exists:
+                add_args = ["worktree", "add", str(wt_path), branch]
+            elif remote_exists:
+                add_args = ["worktree", "add", "-b", branch, str(wt_path), f"origin/{branch}"]
+            else:
+                add_args = ["worktree", "add", "-b", branch, str(wt_path), base_branch]
+
+            add_proc = _run_git(main_root, add_args)
+            if add_proc.returncode != 0:
+                print(f"Error: `git {' '.join(add_args)}` failed:\n{add_proc.stderr.strip()}", file=sys.stderr)
+                return 1
+            created_new = True
+
+            post_cmds = repo_cfg.get("enter", {}).get("post_create_commands", [])
+            if isinstance(post_cmds, list):
+                env = dict(os.environ)
+                env["AGY_WT_MAIN_DIR"] = str(main_root)
+                env["AGY_WT_PATH"] = str(wt_path)
+                env["AGY_WT_BRANCH"] = branch
+                for cmd_str in post_cmds:
+                    if not isinstance(cmd_str, str) or not cmd_str.strip():
+                        continue
+                    p = subprocess.run(cmd_str, shell=True, cwd=str(wt_path), env=env, text=True, capture_output=True)
+                    if p.returncode != 0:
+                        # Safe to force-remove a freshly created worktree and delete its newly created branch
+                        rb = _run_git(main_root, ["worktree", "remove", "--force", str(wt_path)])
+                        if rb.returncode == 0:
+                            if created_branch:
+                                _run_git(main_root, ["branch", "-D", branch])
+                            rb_note = "Rolled back newly created worktree" + (" and branch." if created_branch else ".")
+                        else:
+                            rb_note = f"Note: rollback failed (worktree left at {wt_path}): {rb.stderr.strip()}"
+                        print(
+                            f"Error: post_create_command failed ({cmd_str}):\n"
+                            f"{p.stderr.strip() or p.stdout.strip()}\n{rb_note}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    post_create_logs.append(cmd_str)
+
+    wt_info = wt.find_git_repo_info(wt_path)
+    wt_name = wt_info["wt_name"] if wt_info else wt_path.name
+    actual_branch = (wt_info["branch"] if wt_info else "") or branch
+
+    brain_dir, _, bind_source = _resolve_brain_dir(main_root, args.session, args.brain_dir, consume_hint=True)
+    state_file_str = ""
+    if brain_dir is not None:
+        state_path = wt.state_file_for_brain_dir(brain_dir)
+        state_payload = {
+            "version": 1,
+            "state": "active",
+            "main_dir": str(main_root),
+            "common_dir": str(common_dir),
+            "worktree_path": str(wt_path),
+            "worktree_name": wt_name,
+            "branch": actual_branch,
+            "base_branch": base_branch,
+            "created_by_agy_wt": created_new,
+            "entered_at": _now_iso(),
+            "exited_at": None,
+            "exit_transcript_offset": 0,
+            "exit_transcript_offsets": {},
+        }
+        wt.atomic_write_private(state_path, json.dumps(state_payload, indent=2, ensure_ascii=False) + "\n")
+        state_file_str = str(state_path)
+
+    result = {
+        "action": "created" if created_new else "reused",
+        "main_dir": str(main_root),
+        "worktree_path": str(wt_path),
+        "worktree_name": wt_name,
+        "branch": actual_branch,
+        "base_branch": base_branch,
+        "session_bound": bool(state_file_str),
+        "session_bind_source": bind_source,
+        "state_file": state_file_str,
+        "post_create_commands": post_create_logs,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        verb = "Created and entered" if created_new else "Entered existing"
+        print(f"{verb} worktree: {wt_path}")
+        print(f"  branch: {actual_branch} (base: {base_branch})")
+        print(f"  main:   {main_root}")
+        if state_file_str:
+            print(f"  state:  {state_file_str} ({bind_source})")
+        else:
+            print("  state:  not bound to an agy session (pass --session <cid> to bind statusline & guard)")
+    return 0
+
+
+def cmd_exit(args: argparse.Namespace) -> int:
+    repo = _require_repo(args.repo)
+    main_root: Path = repo["main_root"]
+    cfg = _require_config()
+    repo_cfg = wt.resolve_repo_config(cfg, main_root)
+
+    brain_dir, transcript_path, bind_source = _resolve_brain_dir(
+        main_root, args.session, args.brain_dir, consume_hint=True
+    )
+    state_path = wt.state_file_for_brain_dir(brain_dir) if brain_dir is not None else None
+    cur_state: dict[str, Any] | None = None
+    if state_path is not None:
+        cur_state, state_err = wt.read_worktree_state_strict(state_path)
+        if state_err:
+            print(f"Error: {state_err}", file=sys.stderr)
+            return 1
+
+    if args.remove and args.keep:
+        print("Error: --remove and --keep are mutually exclusive.", file=sys.stderr)
+        return 1
+    default_action = str(repo_cfg.get("exit", {}).get("default_action") or "keep").lower()
+    should_remove = True if args.remove else (False if args.keep else default_action == "remove")
+
+    if not should_remove and state_path is None:
+        print(
+            "Error: no active agy session could be resolved to unbind (pass --session <cid> or --brain-dir <path>).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Only pick cur_state["worktree_path"] when state is active AND belongs to main_root
+    state_matches_repo = bool(
+        cur_state
+        and cur_state.get("state") == "active"
+        and isinstance(cur_state.get("worktree_path"), str)
+        and cur_state["worktree_path"].strip()
+        and wt.same_resolved_path(cur_state.get("main_dir", ""), main_root)
+    )
+
+    wt_path: Path | None = None
+    # When invoked on/targeting a specific linked worktree (e.g. --repo <wtB>), honor that linked worktree first!
+    if should_remove and repo["is_linked"]:
+        wt_path = repo["root"]
+    elif state_matches_repo and cur_state is not None:
+        wt_path = wt.resolve_path_safe(cur_state["worktree_path"])
+    elif repo["is_linked"]:
+        wt_path = repo["root"]
+
+    removed = False
+    app_notes: list[str] = []
+
+    if should_remove:
+        if wt_path is None or not wt_path.is_dir():
+            print("Error: no active worktree directory found for this repository to remove.", file=sys.stderr)
+            return 1
+        # Verify wt_path is a registered linked worktree of main_root BEFORE any cleanup
+        all_wts = _parse_worktree_list(main_root)
+        reg = next((w for w in all_wts if not w.get("is_main") and wt.same_resolved_path(w.get("path", ""), wt_path)), None)
+        if reg is None:
+            print(
+                f"Error: '{wt_path}' is not a registered linked worktree of '{main_root}'; refusing removal.",
+                file=sys.stderr,
+            )
+            return 1
+
+        safe_dirs = repo_cfg.get("exit", {}).get("ignored_safe_dirs", wt.DEFAULT_CONFIG["exit"]["ignored_safe_dirs"])
+        status_info = _inspect_worktree_status(wt_path, safe_dirs)
+        if status_info["dirty"]:
+            print("Error: worktree has uncommitted changes; aborting removal:", file=sys.stderr)
+            for item in status_info["dirty"]:
+                print(f"  {item}", file=sys.stderr)
+            return 1
+        if status_info["untracked"]:
+            print("Error: worktree has untracked files; aborting removal:", file=sys.stderr)
+            for item in status_info["untracked"]:
+                print(f"  ?? {item}", file=sys.stderr)
+            return 1
+        if status_info["ignored_unsafe"] and not args.confirm_ignored:
+            print(
+                "Error: worktree contains ignored files outside ignored_safe_dirs "
+                "(`git worktree remove` would silently delete them). Move keepers to main repo or pass --confirm-ignored:",
+                file=sys.stderr,
+            )
+            for item in status_info["ignored_unsafe"]:
+                print(f"  !! {item}", file=sys.stderr)
+            return 1
+
+        app_notes = _cleanup_macos_app_bundles(wt_path, repo_cfg.get("exit", {}).get("cleanup_macos_app_bundles", "auto"))
+        rm_proc = _run_git(main_root, ["worktree", "remove", str(wt_path)])
+        if rm_proc.returncode != 0:
+            print(f"Error: `git worktree remove` refused:\n{rm_proc.stderr.strip()}", file=sys.stderr)
+            return 1
+        removed = True
+
+    # Only update session state if it belongs to main_root AND matches the removed worktree (never clobber another active wt)
+    session_unbound = False
+    compat_offset = 0
+    offsets: dict[str, int] = {}
+    if state_path is not None:
+        other_repo_active = bool(
+            cur_state
+            and cur_state.get("state") == "active"
+            and cur_state.get("main_dir")
+            and not wt.same_resolved_path(cur_state.get("main_dir", ""), main_root)
+        )
+        other_wt_active = bool(
+            should_remove
+            and wt_path is not None
+            and state_matches_repo
+            and cur_state is not None
+            and not wt.same_resolved_path(cur_state.get("worktree_path", ""), wt_path)
+        )
+        if other_repo_active:
+            if not should_remove:
+                print(
+                    f"Error: current session is bound to a different repository ({cur_state.get('main_dir')}), "
+                    f"not '{main_root}'.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"Warning: removed worktree in '{main_root}', leaving active session binding for '{cur_state.get('main_dir')}' intact.",
+                file=sys.stderr,
+            )
+        elif other_wt_active:
+            print(
+                f"Warning: removed worktree '{wt_path}', leaving active session binding for '{cur_state.get('worktree_path')}' intact.",
+                file=sys.stderr,
+            )
+        else:
+            compat_offset, offsets = _mark_session_exited(
+                state_path, cur_state, main_root, repo["common_dir"], brain_dir, transcript_path
+            )
+            session_unbound = True
+    elif should_remove:
+        print("Warning: removed worktree, but no agy session was resolved to unbind.", file=sys.stderr)
+
+    result = {
+        "state": "exited",
+        "main_dir": str(main_root),
+        "worktree_path": str(wt_path) if wt_path else "",
+        "removed": removed,
+        "session_unbound": session_unbound,
+        "exit_transcript_offset": compat_offset,
+        "exit_transcript_offsets": offsets,
+        "session_bind_source": bind_source,
+        "app_cleanup_notes": app_notes,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        action_txt = "Exited and removed" if removed else "Exited (kept on disk)"
+        print(f"{action_txt} worktree: {wt_path or '(none)'}")
+        for note in app_notes:
+            print(f"  {note}")
+    return 0
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    """Execute the complete 6-step post-merge worktree closeout workflow."""
+    repo = _require_repo(args.repo)
+    main_root: Path = repo["main_root"]
+    cfg = _require_config()
+    repo_cfg = wt.resolve_repo_config(cfg, main_root)
+
+    brain_dir, transcript_path, _ = _resolve_brain_dir(
+        main_root, args.session, args.brain_dir, consume_hint=True
+    )
+    state_path = wt.state_file_for_brain_dir(brain_dir) if brain_dir is not None else None
+    cur_state: dict[str, Any] | None = None
+    if state_path is not None:
+        cur_state, state_err = wt.read_worktree_state_strict(state_path)
+        if state_err:
+            print(f"Error: {state_err}", file=sys.stderr)
+            return 1
+
+    all_wts = _parse_worktree_list(main_root)
+    target_wt: dict[str, Any] | None = None
+
+    if args.target:
+        t = args.target.strip()
+        t_resolved = wt.resolve_path_safe(t, base_dir=main_root)
+        for w in all_wts:
+            if w.get("is_main"):
+                continue
+            if w.get("branch") == t or wt.same_resolved_path(w.get("path", ""), t_resolved) or Path(w["path"]).name == t:
+                target_wt = w
+                break
+    elif repo["is_linked"]:
+        target_wt = next(
+            (w for w in all_wts if not w.get("is_main") and wt.same_resolved_path(w.get("path", ""), repo["root"])),
+            None,
+        )
+    elif (
+        cur_state
+        and cur_state.get("state") == "active"
+        and isinstance(cur_state.get("worktree_path"), str)
+        and cur_state["worktree_path"].strip()
+        and wt.same_resolved_path(cur_state.get("main_dir", ""), main_root)
+    ):
+        t_resolved = wt.resolve_path_safe(cur_state["worktree_path"])
+        target_wt = next(
+            (w for w in all_wts if not w.get("is_main") and wt.same_resolved_path(w.get("path", ""), t_resolved)),
+            None,
+        )
+
+    if target_wt is None:
+        print("Error: could not identify target linked worktree to close. Pass branch name or worktree path.", file=sys.stderr)
+        return 1
+
+    wt_path = Path(target_wt["path"])
+    branch = str(target_wt.get("branch") or "")
+    if not branch:
+        print(f"Error: worktree '{wt_path}' is detached (no branch name).", file=sys.stderr)
+        return 1
+
+    base_branch = _detect_base_branch(main_root, repo_cfg, args.base)
+    has_remote = _git_has_remote(main_root)
+    steps_log: list[str] = []
+
+    # Step 1: Verify branch content matches merged base branch
+    if has_remote:
+        fetch_proc = _run_git(main_root, ["fetch", "--prune"])
+        if fetch_proc.returncode != 0:
+            print(f"Error [Step 1]: `git fetch --prune` failed:\n{fetch_proc.stderr.strip()}", file=sys.stderr)
+            return 1
+        compare_ref = f"origin/{base_branch}"
+    else:
+        compare_ref = base_branch
+
+    if not args.skip_diff_check:
+        diff_proc = _run_git(main_root, ["diff", "--quiet", compare_ref, branch, "--"])
+        if diff_proc.returncode != 0:
+            stat_proc = _run_git(main_root, ["diff", "--stat", compare_ref, branch, "--"])
+            print(
+                f"Error [Step 1]: branch '{branch}' differs from '{compare_ref}'; aborting closeout:\n"
+                f"{stat_proc.stdout.strip() or diff_proc.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+        steps_log.append(f"Step 1 OK: `{branch}` matches `{compare_ref}` (zero diff)")
+    else:
+        steps_log.append("Step 1 SKIPPED (--skip-diff-check)")
+
+    # Step 2: Inspect worktree status including ignored files (silent-deletion trap)
+    safe_dirs = repo_cfg.get("exit", {}).get("ignored_safe_dirs", wt.DEFAULT_CONFIG["exit"]["ignored_safe_dirs"])
+    status_info = _inspect_worktree_status(wt_path, safe_dirs)
+    if status_info["dirty"]:
+        print("Error [Step 2]: uncommitted changes in worktree; aborting:", file=sys.stderr)
+        for line in status_info["dirty"]:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    if status_info["untracked"]:
+        print("Error [Step 2]: untracked files in worktree; move to main repo or clean up first:", file=sys.stderr)
+        for item in status_info["untracked"]:
+            print(f"  ?? {item}", file=sys.stderr)
+        return 1
+    if status_info["ignored_unsafe"] and not args.confirm_ignored:
+        print(
+            "Error [Step 2]: ignored files outside ignored_safe_dirs detected "
+            "(`git worktree remove` silently deletes ignored files!). "
+            "Move keepers to main repo or re-run with --confirm-ignored:",
+            file=sys.stderr,
+        )
+        for item in status_info["ignored_unsafe"]:
+            print(f"  !! {item}", file=sys.stderr)
+        return 1
+    steps_log.append(
+        f"Step 2 OK: worktree clean (safe ignored: {len(status_info['ignored_safe'])}, "
+        f"extra ignored: {len(status_info['ignored_unsafe'])})"
+    )
+
+    # Step 3: Fast-forward main repo & run post_merge_commands
+    main_cur = wt.read_git_head(repo["common_dir"])
+    if main_cur != base_branch:
+        print(f"Error [Step 3]: main repo is on '{main_cur}', expected '{base_branch}'.", file=sys.stderr)
+        return 1
+    if has_remote:
+        pull_proc = _run_git(main_root, ["pull", "--ff-only"])
+        if pull_proc.returncode != 0:
+            print(f"Error [Step 3]: main repo `git pull --ff-only` failed:\n{pull_proc.stderr.strip()}", file=sys.stderr)
+            return 1
+
+    ran_post_merge: list[str] = []
+    if not args.skip_post_merge:
+        post_cmds = repo_cfg.get("exit", {}).get("post_merge_commands", [])
+        if isinstance(post_cmds, list):
+            for cmd_str in post_cmds:
+                if not isinstance(cmd_str, str) or not cmd_str.strip():
+                    continue
+                p = subprocess.run(cmd_str, shell=True, cwd=str(main_root), text=True, capture_output=True)
+                if p.returncode != 0:
+                    print(
+                        f"Error [Step 3]: post_merge_command failed ({cmd_str}):\n{p.stderr.strip() or p.stdout.strip()}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                ran_post_merge.append(cmd_str)
+    steps_log.append(
+        f"Step 3 OK: main repo updated" + (f" + ran {ran_post_merge}" if ran_post_merge else "")
+    )
+
+    # Step 4: Clean worktree macOS .app bundles & remove worktree WITHOUT --force
+    app_notes = _cleanup_macos_app_bundles(wt_path, repo_cfg.get("exit", {}).get("cleanup_macos_app_bundles", "auto"))
+    rm_proc = _run_git(main_root, ["worktree", "remove", str(wt_path)])
+    if rm_proc.returncode != 0:
+        print(
+            f"Error [Step 4]: `git worktree remove` refused (never uses --force):\n{rm_proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1
+    if wt_path.exists():
+        print(f"Error [Step 4]: worktree directory still exists after removal: {wt_path}", file=sys.stderr)
+        return 1
+    steps_log.append(f"Step 4 OK: removed worktree {wt_path}" + (f" ({len(app_notes)} app cleanup actions)" if app_notes else ""))
+
+    # Immediately flip session state to exited once worktree directory is gone (even if Step 5/6 fails later)
+    if state_path is not None and cur_state and wt.same_resolved_path(cur_state.get("worktree_path", ""), wt_path):
+        _mark_session_exited(state_path, cur_state, main_root, repo["common_dir"], brain_dir, transcript_path)
+
+    # Step 5: Delete local branch (-D for squash merges) and remote branch + prune
+    del_local = _run_git(main_root, ["branch", "-D", branch])
+    if del_local.returncode != 0:
+        print(f"Error [Step 5]: `git branch -D {branch}` failed:\n{del_local.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    will_delete_remote = bool(
+        has_remote and repo_cfg.get("exit", {}).get("delete_remote_branch", True) and not args.no_remote_delete
+    )
+    if not has_remote:
+        remote_status = "no-remote"
+    elif not will_delete_remote:
+        remote_status = "skipped"
+    else:
+        exact_ref = f"refs/heads/{branch}"
+        ls_rem = _run_git(main_root, ["ls-remote", "--heads", "origin", exact_ref])
+        if ls_rem.returncode != 0:
+            print(
+                f"Error [Step 5]: `git ls-remote --heads origin {exact_ref}` failed:\n{ls_rem.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+        ref_exists = any(line.endswith(f"\t{exact_ref}") for line in ls_rem.stdout.splitlines())
+        if ref_exists:
+            del_rem = _run_git(main_root, ["push", "origin", "--delete", exact_ref])
+            if del_rem.returncode != 0:
+                print(
+                    f"Error [Step 5]: `git push origin --delete {exact_ref}` failed:\n{del_rem.stderr.strip()}",
+                    file=sys.stderr,
+                )
+                return 1
+            remote_status = "deleted"
+        else:
+            remote_status = "already-absent"
+
+        prune_proc = _run_git(main_root, ["fetch", "--prune"])
+        if prune_proc.returncode != 0:
+            print(
+                f"Error [Step 5]: `git fetch --prune` failed:\n{prune_proc.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+    steps_log.append(f"Step 5 OK: deleted local branch `{branch}` (remote: {remote_status})")
+
+    # Step 6: Double verification using plumbing `for-each-ref` (immune to color/column/+branch quirks)
+    remaining_wts = _parse_worktree_list(main_root)
+    wt_still_present = any(wt.same_resolved_path(w.get("path", ""), wt_path) for w in remaining_wts)
+    ref_proc = _run_git(main_root, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"])
+    if ref_proc.returncode != 0:
+        print(f"Error [Step 6]: `git for-each-ref` failed:\n{ref_proc.stderr.strip()}", file=sys.stderr)
+        return 1
+    ref_set = {r.strip() for r in ref_proc.stdout.splitlines() if r.strip()}
+    local_still_present = f"refs/heads/{branch}" in ref_set
+    remote_still_present = will_delete_remote and (f"refs/remotes/origin/{branch}" in ref_set)
+    if wt_still_present or local_still_present or remote_still_present:
+        print(
+            f"Error [Step 6]: verification failed "
+            f"(wt_present={wt_still_present}, local_branch={local_still_present}, remote_branch={remote_still_present}).",
+            file=sys.stderr,
+        )
+        return 1
+    steps_log.append("Step 6 OK: verified worktree and branches are gone via `worktree list` & `for-each-ref`")
+
+    result = {
+        "closed": True,
+        "main_dir": str(main_root),
+        "worktree_path": str(wt_path),
+        "branch": branch,
+        "remote_branch_status": remote_status,
+        "post_merge_commands": ran_post_merge,
+        "app_cleanup_notes": app_notes,
+        "steps": steps_log,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"Closed merged worktree '{branch}' ({wt_path}):")
+        for s in steps_log:
+            print(f"  - {s}")
+        for note in app_notes:
+            print(f"  - {note}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    repo = _require_repo(args.repo)
+    main_root: Path = repo["main_root"]
+    cfg = _require_config()
+    repo_cfg = wt.resolve_repo_config(cfg, main_root)
+    is_strict = wt.is_strict_main_repo(cfg, main_root)
+    brain_dir, _, bind_source = _resolve_brain_dir(main_root, args.session, args.brain_dir)
+    state_path = wt.state_file_for_brain_dir(brain_dir) if brain_dir is not None else None
+    cur_state: dict[str, Any] | None = None
+    if state_path is not None:
+        cur_state, state_err = wt.read_worktree_state_strict(state_path)
+        if state_err:
+            print(f"Error: {state_err}", file=sys.stderr)
+            return 1
+
+    wt_raw = str(cur_state.get("worktree_path") or "").strip() if cur_state else ""
+    active = bool(
+        cur_state
+        and cur_state.get("state") == "active"
+        and wt_raw
+        and wt.same_resolved_path(cur_state.get("main_dir", ""), main_root)
+        and wt.resolve_path_safe(wt_raw).is_dir()
+    )
+
+    guard_cfg = repo_cfg.get("guard") if isinstance(repo_cfg.get("guard"), dict) else {}
+    out = {
+        "main_dir": str(main_root),
+        "current_dir": str(repo["root"]),
+        "current_is_linked": repo["is_linked"],
+        "current_branch": repo["branch"],
+        "strict_main_repo": is_strict,
+        "guard_enabled": bool(guard_cfg.get("enabled", True)),
+        "guard_mode": str(guard_cfg.get("mode", "active-and-strict")),
+        "protected_paths": repo_cfg.get("protected_paths", []),
+        "session_bind_source": bind_source,
+        "state_file": str(state_path) if state_path else "",
+        "session_active": active,
+        "session_state": cur_state,
+    }
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    else:
+        print(f"Main repo:  {main_root} (branch: {wt.read_git_head(repo['common_dir'])})")
+        print(f"Strict:     {'yes' if is_strict else 'no'} (guard: {out['guard_mode'] if out['guard_enabled'] else 'disabled'})")
+        if active and cur_state:
+            print(f"Active WT:  {wt_raw} (branch: {cur_state.get('branch')})")
+        else:
+            print("Active WT:  none")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    repo = _require_repo(args.repo)
+    main_root: Path = repo["main_root"]
+    brain_dir, _, _ = _resolve_brain_dir(main_root, args.session, args.brain_dir)
+    cur_state = wt.read_worktree_state(wt.state_file_for_brain_dir(brain_dir)) if brain_dir else None
+    wt_raw = str(cur_state.get("worktree_path") or "").strip() if cur_state else ""
+    active_path = (
+        wt.resolve_path_safe(wt_raw)
+        if (
+            cur_state
+            and cur_state.get("state") == "active"
+            and wt_raw
+            and wt.same_resolved_path(cur_state.get("main_dir", ""), main_root)
+        )
+        else None
+    )
+    entries = _parse_worktree_list(main_root)
+    for e in entries:
+        e["session_active"] = bool(active_path is not None and wt.same_resolved_path(e.get("path", ""), active_path))
+
+    if args.json:
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+    else:
+        for e in entries:
+            markers = []
+            if e.get("is_main"):
+                markers.append("main")
+            if e.get("session_active"):
+                markers.append("ACTIVE")
+            if e.get("prunable"):
+                markers.append("prunable")
+            tag = f" [{' '.join(markers)}]" if markers else ""
+            print(f"  {e.get('branch') or '(detached)':32s}  {e.get('path')}{tag}")
+    return 0
+
+
+def cmd_strict(args: argparse.Namespace) -> int:
+    cfg_path = wt.default_config_path()
+    try:
+        raw_cfg, _ = wt.load_raw_config_strict(cfg_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    strict_list = raw_cfg.get("strict_main_repos")
+    if not isinstance(strict_list, list):
+        strict_list = []
+
+    if args.strict_action == "list":
+        if args.json:
+            print(json.dumps({"config_path": str(cfg_path), "strict_main_repos": strict_list}, indent=2, ensure_ascii=False))
+        else:
+            if not strict_list:
+                print(f"No strict_main_repos configured ({cfg_path}).")
+            else:
+                print(f"strict_main_repos ({cfg_path}):")
+                for item in strict_list:
+                    print(f"  - {item}")
+        return 0
+
+    target_raw = args.path
+    if target_raw:
+        resolved = wt.resolve_path_safe(target_raw)
+        repo_info = wt.find_git_repo_info(resolved)
+        main_root = repo_info["main_root"] if repo_info else resolved
+    else:
+        repo_info = _require_repo(None)
+        main_root = repo_info["main_root"]
+
+    display_entry = wt.normalize_home_display(main_root)
+
+    if args.strict_action == "add":
+        if not any(isinstance(x, str) and wt.entry_matches_repo(x, main_root) for x in strict_list):
+            strict_list.append(display_entry)
+            raw_cfg["strict_main_repos"] = strict_list
+            wt.atomic_write_private(cfg_path, json.dumps(raw_cfg, indent=2, ensure_ascii=False) + "\n")
+            print(f"Added to strict_main_repos: {display_entry}")
+        else:
+            print(f"Already in strict_main_repos: {display_entry}")
+        return 0
+
+    if args.strict_action == "remove":
+        before = len(strict_list)
+        filtered = [x for x in strict_list if not (isinstance(x, str) and wt.entry_matches_repo(x, main_root))]
+        if len(filtered) == before:
+            print(f"Not found in strict_main_repos: {display_entry}")
+            return 0
+        raw_cfg["strict_main_repos"] = filtered
+        wt.atomic_write_private(cfg_path, json.dumps(raw_cfg, indent=2, ensure_ascii=False) + "\n")
+        print(f"Removed from strict_main_repos: {display_entry}")
+        return 0
+
+    return 1
+
+
+def cmd_init_config(args: argparse.Namespace) -> int:
+    cfg_path = wt.default_config_path()
+    if cfg_path.exists() and not args.force:
+        print(f"Config already exists: {cfg_path} (pass --force to overwrite)")
+        return 0
+    example = wt.plugin_root() / "config.example.json"
+    if example.is_file():
+        content = example.read_text(encoding="utf-8")
+    else:
+        content = json.dumps(wt.DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n"
+    wt.atomic_write_private(cfg_path, content)
+    print(f"Wrote config: {cfg_path}")
+    return 0
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. git binary
+    git_p = subprocess.run(["git", "--version"], text=True, capture_output=True, check=False)
+    checks.append(("git binary", git_p.returncode == 0, git_p.stdout.strip() or git_p.stderr.strip()))
+
+    # 2. Config file + raw schema validation (types, guard.mode & install_command_patterns across global + repos)
+    cfg_path = wt.default_config_path()
+    raw_cfg: dict[str, Any] = {}
+    raw_existed = False
+    cfg_err: str | None = None
+    try:
+        raw_cfg, raw_existed = wt.load_raw_config_strict(cfg_path)
+        cfg = wt.deep_merge(wt.DEFAULT_CONFIG, raw_cfg) if raw_existed else wt.deep_merge(wt.DEFAULT_CONFIG, {})
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        cfg_err = f"Invalid or unreadable config {cfg_path}: {exc}"
+        cfg = wt.deep_merge(wt.DEFAULT_CONFIG, {})
+
+    if cfg_err:
+        checks.append(("config file", False, cfg_err))
+    else:
+        type_issues: list[str] = []
+        if "strict_main_repos" in raw_cfg and not isinstance(raw_cfg["strict_main_repos"], list):
+            type_issues.append("strict_main_repos must be a JSON list")
+        for sect in ("guard", "enter", "exit", "repos"):
+            if sect in raw_cfg and not isinstance(raw_cfg[sect], dict):
+                type_issues.append(f"{sect} must be a JSON object")
+
+        strict_raw = cfg.get("strict_main_repos")
+        strict_cnt = len(strict_raw) if isinstance(strict_raw, list) else 0
+        detail = f"{cfg_path} (strict_main_repos={strict_cnt})" if raw_existed else f"using built-in defaults ({cfg_path} not created yet)"
+        if type_issues:
+            checks.append(("config file", False, "; ".join(type_issues)))
+        else:
+            checks.append(("config file", True, detail))
+
+        # Validate guard.mode and install_command_patterns globally and across all repos overrides
+        guard_issues: list[str] = []
+        g_mode = str(cfg.get("guard", {}).get("mode", "")).strip().lower()
+        if g_mode not in wt.VALID_GUARD_MODES:
+            guard_issues.append(f"global guard.mode={g_mode!r}")
+        for pat in cfg.get("guard", {}).get("install_command_patterns", []):
+            if not isinstance(pat, str):
+                guard_issues.append("global install_command_patterns contains non-string")
+            else:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    guard_issues.append(f"global {pat!r}: {exc}")
+
+        raw_repos = raw_cfg.get("repos") if isinstance(raw_cfg.get("repos"), dict) else {}
+        for rkey, rval in raw_repos.items():
+            if not isinstance(rval, dict):
+                guard_issues.append(f"repos[{rkey!r}] must be a JSON object")
+                continue
+            r_eff_g = wt.effective_guard_for_override(cfg.get("guard", {}), rval)
+            rmode = str(r_eff_g.get("mode", "")).strip().lower()
+            if rmode not in wt.VALID_GUARD_MODES:
+                guard_issues.append(f"repos[{rkey!r}].guard.mode={rmode!r}")
+            for pat in r_eff_g.get("install_command_patterns", []):
+                if not isinstance(pat, str):
+                    guard_issues.append(f"repos[{rkey!r}] install_command_patterns contains non-string")
+                else:
+                    try:
+                        re.compile(pat)
+                    except re.error as exc:
+                        guard_issues.append(f"repos[{rkey!r}] {pat!r}: {exc}")
+
+        if guard_issues:
+            checks.append(("guard config", False, "; ".join(guard_issues)))
+        else:
+            checks.append(("guard config", True, f"mode={g_mode}, patterns valid"))
+
+    # 3. Installed plugin + drift detection + smoke test of the ACTUAL installed guard
+    installed_root = Path.home() / ".gemini" / "config" / "plugins" / "agy-worktree"
+    installed_hooks = installed_root / "hooks.json"
+    installed_guard = installed_root / "scripts" / "worktree-guard.py"
+    source_root = wt.plugin_root()
+
+    if installed_hooks.is_file() and installed_guard.is_file():
+        drift_files: list[str] = []
+        if not wt.same_resolved_path(installed_root, source_root):
+            for rel in ("hooks.json", "scripts/agy-wt", "scripts/worktree-guard.py", "scripts/wt_common.py"):
+                h_src = _sha256_file(source_root / rel)
+                h_inst = _sha256_file(installed_root / rel)
+                if h_src is not None and h_inst != h_src:
+                    drift_files.append(rel)
+        if drift_files:
+            checks.append(
+                (
+                    "installed plugin",
+                    False,
+                    f"out of sync with {source_root} ({', '.join(drift_files)}); run `agy plugin install {source_root}`",
+                )
+            )
+        else:
+            checks.append(("installed plugin", True, str(installed_hooks)))
+        guard_to_test = installed_guard
+        guard_cwd = installed_root
+    else:
+        checks.append(
+            (
+                "installed plugin",
+                False,
+                f"missing {installed_hooks} or {installed_guard}",
+            )
+        )
+        guard_to_test = SCRIPT_DIR / "worktree-guard.py"
+        guard_cwd = source_root
+
+    # 4. Guard script smoke + latency
+    if guard_to_test.is_file():
+        smoke_payload = json.dumps(
+            {
+                "conversationId": "doctor-smoke",
+                "cwd": "/tmp",
+                "toolCall": {"name": "write_file", "args": {"Path": "/tmp/doctor-smoke.txt"}},
+            }
+        )
+        t0 = time.perf_counter()
+        proc = subprocess.run(
+            ["python3", "-BS", str(guard_to_test)],
+            input=smoke_payload,
+            cwd=str(guard_cwd),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        ms = (time.perf_counter() - t0) * 1000.0
+        ok = proc.returncode == 0 and '"allow"' in proc.stdout
+        checks.append(("worktree-guard smoke", ok, f"{ms:.1f}ms ({proc.stdout.strip() or proc.stderr.strip()})"))
+    else:
+        checks.append(("worktree-guard smoke", False, f"missing {guard_to_test}"))
+
+    # 5. strict_main_repos paths check (only when config loaded; skip bare repo basenames)
+    if cfg_err:
+        checks.append(("strict_main_repos paths", False, "skipped due to config error"))
+    else:
+        strict_list = cfg.get("strict_main_repos")
+        if not isinstance(strict_list, list):
+            checks.append(("strict_main_repos paths", False, "strict_main_repos must be a JSON list"))
+        else:
+            missing_repos = [
+                r
+                for r in strict_list
+                if isinstance(r, str)
+                and ("/" in r or r.startswith("~"))
+                and not Path(r).expanduser().exists()
+            ]
+            checks.append(
+                (
+                    "strict_main_repos paths",
+                    len(missing_repos) == 0,
+                    "all exist" if not missing_repos else f"missing: {', '.join(missing_repos)}",
+                )
+            )
+
+    # 6. Session hint directory health
+    hdir = wt.hint_dir_path()
+    try:
+        st_h = os.lstat(str(hdir))
+        ok_h = (
+            stat.S_ISDIR(st_h.st_mode)
+            and (not hasattr(os, "getuid") or st_h.st_uid == os.getuid())
+            and (stat.S_IMODE(st_h.st_mode) & 0o077 == 0)
+        )
+        checks.append(("session hint dir", ok_h, f"{hdir} (mode={oct(stat.S_IMODE(st_h.st_mode))})"))
+    except FileNotFoundError:
+        checks.append(("session hint dir", True, f"{hdir} (will be created on first hook run)"))
+    except OSError as exc:
+        checks.append(("session hint dir", False, f"{hdir}: {exc}"))
+
+    all_ok = all(ok for _, ok, _ in checks)
+    for name, ok, detail in checks:
+        tag = "[OK]" if ok else "[FAIL]"
+        print(f"{tag:6s} {name}: {detail}")
+    return 0 if all_ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="agy-wt", description="Antigravity CLI git worktree manager")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_enter = sub.add_parser("enter", help="Create or reuse a linked worktree and bind current agy session")
+    p_enter.add_argument("branch", help="Git branch name (e.g. feat/my-feature)")
+    p_enter.add_argument("--base", help="Base branch/ref when creating a new branch")
+    p_enter.add_argument("--path", help="Explicit worktree directory path")
+    p_enter.add_argument("--existing", action="store_true", help="Only enter an already existing worktree")
+    p_enter.add_argument("--no-pull", action="store_true", help="Skip `git pull --ff-only` in main repo")
+    p_enter.add_argument("--repo", help="Target repository path (defaults to cwd)")
+    p_enter.add_argument("--session", help="Explicit agy conversation ID")
+    p_enter.add_argument("--brain-dir", help="Explicit <data_dir>/brain/<cid> path")
+    p_enter.add_argument("--json", action="store_true", help="Output JSON")
+    p_enter.set_defaults(func=cmd_enter)
+
+    p_exit = sub.add_parser("exit", help="Unbind current agy session from its active worktree")
+    p_exit.add_argument("--remove", action="store_true", help="Remove the worktree after safety checks (no --force)")
+    p_exit.add_argument("--keep", action="store_true", help="Keep the worktree on disk")
+    p_exit.add_argument("--confirm-ignored", action="store_true", help="Allow deleting ignored files outside safe dirs")
+    p_exit.add_argument("--repo", help="Target repository path (defaults to cwd)")
+    p_exit.add_argument("--session", help="Explicit agy conversation ID")
+    p_exit.add_argument("--brain-dir", help="Explicit <data_dir>/brain/<cid> path")
+    p_exit.add_argument("--json", action="store_true", help="Output JSON")
+    p_exit.set_defaults(func=cmd_exit)
+
+    p_close = sub.add_parser("close", help="Run 6-step post-merge closeout (verify, clean, pull, remove, delete branches)")
+    p_close.add_argument("target", nargs="?", help="Branch name or worktree path (defaults to active session worktree)")
+    p_close.add_argument("--base", help="Base branch to compare against (default: auto)")
+    p_close.add_argument("--skip-diff-check", action="store_true", help="Skip Step 1 origin/main diff check")
+    p_close.add_argument("--skip-post-merge", action="store_true", help="Skip Step 3 post_merge_commands")
+    p_close.add_argument("--no-remote-delete", action="store_true", help="Skip deleting remote branch in Step 5")
+    p_close.add_argument("--confirm-ignored", action="store_true", help="Confirm deleting ignored files outside safe dirs")
+    p_close.add_argument("--repo", help="Target repository path (defaults to cwd)")
+    p_close.add_argument("--session", help="Explicit agy conversation ID")
+    p_close.add_argument("--brain-dir", help="Explicit <data_dir>/brain/<cid> path")
+    p_close.add_argument("--json", action="store_true", help="Output JSON")
+    p_close.set_defaults(func=cmd_close)
+
+    p_status = sub.add_parser("status", help="Show worktree and guard status for current repo/session")
+    p_status.add_argument("--repo", help="Target repository path (defaults to cwd)")
+    p_status.add_argument("--session", help="Explicit agy conversation ID")
+    p_status.add_argument("--brain-dir", help="Explicit <data_dir>/brain/<cid> path")
+    p_status.add_argument("--json", action="store_true", help="Output JSON")
+    p_status.set_defaults(func=cmd_status)
+
+    p_list = sub.add_parser("list", help="List all worktrees for current repository")
+    p_list.add_argument("--repo", help="Target repository path (defaults to cwd)")
+    p_list.add_argument("--session", help="Explicit agy conversation ID")
+    p_list.add_argument("--brain-dir", help="Explicit <data_dir>/brain/<cid> path")
+    p_list.add_argument("--json", action="store_true", help="Output JSON")
+    p_list.set_defaults(func=cmd_list)
+
+    p_strict = sub.add_parser("strict", help="Manage strict_main_repos list in ~/.gemini/config/agy-worktree.json")
+    p_strict.add_argument("strict_action", choices=("add", "remove", "list"))
+    p_strict.add_argument("path", nargs="?", help="Repository path (defaults to current repo root)")
+    p_strict.add_argument("--json", action="store_true", help="Output JSON")
+    p_strict.set_defaults(func=cmd_strict)
+
+    p_init = sub.add_parser("init-config", help="Create ~/.gemini/config/agy-worktree.json from template")
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing config")
+    p_init.set_defaults(func=cmd_init_config)
+
+    p_doc = sub.add_parser("doctor", help="Diagnose agy-worktree configuration, installed plugin drift, and latency")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

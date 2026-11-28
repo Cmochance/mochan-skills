@@ -1,0 +1,39 @@
+{
+  "strict_main_repos": [],
+  "path_template": "../{repo}-worktree/{repo}-{branch_slug}",
+  "branch_slug_separator": "-",
+  "default_base_branch": "auto",
+  "protected_paths": [],
+  "guard": {
+    "enabled": true,
+    "mode": "active-and-strict",
+    "block_install_in_worktree": true,
+    "install_command_patterns": [
+      "\\bmake\\s+(?:.*\\s)?install\\b"
+    ],
+    "allow_main_paths": [
+      ".git/info/exclude"
+    ]
+  },
+  "enter": {
+    "auto_pull_main": true,
+    "post_create_commands": []
+  },
+  "exit": {
+    "default_action": "keep",
+    "ignored_safe_dirs": [
+      "build",
+      "dist",
+      ".build",
+      "target",
+      "node_modules",
+      ".pytest_cache",
+      "__pycache__",
+      ".venv"
+    ],
+    "cleanup_macos_app_bundles": "auto",
+    "delete_remote_branch": true,
+    "post_merge_commands": []
+  },
+  "repos": {}
+}

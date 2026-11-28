@@ -132,15 +132,18 @@ class StatuslineRendererTest(IsolatedTestCase):
         (git_dir / "HEAD").write_text("abcdef1234567890\n", encoding="utf-8")
         self.assertEqual(sl.detect_worktree({}, str(repo)), ("abcdef1", False))
 
-        # Linked worktree with relative gitdir
+        # Linked worktree with relative gitdir: default label="branch", optional label="name"
         base = self.root / "bare"
         wt_git = base / ".git" / "worktrees" / "wt-alpha"
         wt_git.mkdir(parents=True)
         (wt_git / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+        (wt_git / "commondir").write_text("../..\n", encoding="utf-8")
         wt_dir = self.root / "wt-dir"
         wt_dir.mkdir()
         (wt_dir / ".git").write_text(f"gitdir: {os.path.relpath(wt_git, wt_dir)}\n", encoding="utf-8")
-        self.assertEqual(sl.detect_worktree({}, str(wt_dir)), ("wt-alpha", True))
+        self.assertEqual(sl.detect_worktree({}, str(wt_dir)), ("topic", True))
+        cfg_name = sl._deep_merge(sl.DEFAULT_CONFIG, {"worktree": {"label": "name"}})
+        self.assertEqual(sl.detect_worktree({}, str(wt_dir), cfg=cfg_name), ("wt-alpha", True))
 
         # Submodule inside an ancestor directory literally named "worktrees" must NOT be flagged linked
         sub_parent = self.root / "worktrees" / "projA"
@@ -158,6 +161,298 @@ class StatuslineRendererTest(IsolatedTestCase):
         (corrupt / ".git").write_text("gitdir: bad\x00path\n", encoding="utf-8")
         name, linked = sl.detect_worktree({}, str(corrupt))
         self.assertEqual((name, linked), ("corrupt-repo", False))
+
+    def test_layer1_session_worktree_and_layer2_transcript_probe(self) -> None:
+        # Build a main repo + same-repo linked worktree + unrelated repo linked worktree
+        main_repo = self.root / "myrepo"
+        (main_repo / ".git").mkdir(parents=True)
+        (main_repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+        wt_git = main_repo / ".git" / "worktrees" / "myrepo-feat-ui"
+        wt_git.mkdir(parents=True)
+        (wt_git / "HEAD").write_text("ref: refs/heads/feat/ui\n", encoding="utf-8")
+        (wt_git / "commondir").write_text("../..\n", encoding="utf-8")
+        wt_dir = self.root / "myrepo-worktree" / "myrepo-feat-ui"
+        (wt_dir / "src").mkdir(parents=True)
+        (wt_dir / ".git").write_text(f"gitdir: {wt_git}\n", encoding="utf-8")
+
+        other_repo = self.root / "other-repo"
+        (other_repo / ".git").mkdir(parents=True)
+        (other_repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        other_wt_git = other_repo / ".git" / "worktrees" / "other-feat"
+        other_wt_git.mkdir(parents=True)
+        (other_wt_git / "HEAD").write_text("ref: refs/heads/feat/other\n", encoding="utf-8")
+        (other_wt_git / "commondir").write_text("../..\n", encoding="utf-8")
+        other_wt_dir = self.root / "other-wt"
+        other_wt_dir.mkdir()
+        (other_wt_dir / ".git").write_text(f"gitdir: {other_wt_git}\n", encoding="utf-8")
+
+        cid = "test-conv-001"
+        brain_conv = self.data_dir / "brain" / cid
+        scratch = brain_conv / "scratch"
+        logs_dir = brain_conv / ".system_generated" / "logs"
+        scratch.mkdir(parents=True)
+        logs_dir.mkdir(parents=True)
+        transcript = logs_dir / "transcript.jsonl"
+
+        # Layer 1 active worktree.json takes precedence and suppresses main repo's vcs.dirty
+        (scratch / "worktree.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "state": "active",
+                    "main_dir": str(main_repo),
+                    "worktree_path": str(wt_dir),
+                    "worktree_name": "myrepo-feat-ui",
+                    "branch": "feat/ui",
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = {
+            "session_id": cid,
+            "transcript_path": str(transcript),
+            "workspace": {"current_dir": str(main_repo)},
+            "vcs": {"branch": "main", "dirty": True},
+            "model": {"display_name": "G4"},
+            "terminal_width": 120,
+        }
+        rendered_l1 = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ feat/ui", rendered_l1)
+        self.assertNotIn("⎇ ~feat/ui", rendered_l1)
+        self.assertNotIn("feat/ui*", rendered_l1)
+
+        # Switching workspace to other_repo rejects myrepo's worktree.json (commondir mismatch)
+        payload_other = dict(payload, workspace={"current_dir": str(other_repo)})
+        self.assertEqual(sl.detect_worktree(payload_other, str(other_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("main", False))
+
+        # Layer 2 transcript probe with real agy double-JSON-encoded tool_calls args
+        (scratch / "worktree.json").unlink()
+        line1 = json.dumps(
+            {
+                "step_index": 1,
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": json.dumps(str(wt_dir / "src" / "app.py"))}},
+                    {"name": "read_file", "args": {"Path": json.dumps(str(other_wt_dir / "README.md"))}},
+                ],
+            }
+        )
+        transcript.write_text(line1 + "\n", encoding="utf-8")
+        rendered_l2 = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ ~feat/ui", rendered_l2)
+        self.assertTrue((scratch / "wt_probe_cache.json").is_file())
+
+        # Appending non-tool text preserves previously detected linked worktree via incremental cache
+        with open(transcript, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps({"step_index": 2, "content": "plain reply"}) + "\n")
+        rendered_l2_cached = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ ~feat/ui", rendered_l2_cached)
+
+        # Exited state with exit_transcript_offset blocks re-detecting pre-exit transcript lines
+        offset_now = transcript.stat().st_size
+        (scratch / "worktree.json").write_text(
+            json.dumps({"version": 1, "state": "exited", "exit_transcript_offset": offset_now}),
+            encoding="utf-8",
+        )
+        rendered_exited = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ main*", rendered_exited)
+        self.assertNotIn("feat/ui", rendered_exited)
+
+        # New tool call AFTER exit_transcript_offset IS detected on exact line boundary
+        with open(transcript, "a", encoding="utf-8") as fp:
+            fp.write(
+                json.dumps(
+                    {
+                        "step_index": 3,
+                        "tool_calls": [
+                            {"name": "run_command", "args": {"CommandLine": json.dumps(f"git -C '{wt_dir}' status")}}
+                        ],
+                    }
+                )
+                + "\n"
+            )
+        rendered_reentered = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ ~feat/ui", rendered_reentered)
+
+        # Disabling auto_detect_from_transcript suppresses Layer 2
+        cfg_no_auto = sl._deep_merge(sl.DEFAULT_CONFIG, {"worktree": {"auto_detect_from_transcript": False}})
+        rendered_no_auto = strip_ansi(sl.render(payload, config=cfg_no_auto, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ main*", rendered_no_auto)
+
+        # Deleting worktree directory clears stale Layer 2 detection immediately
+        import shutil
+
+        shutil.rmtree(wt_dir)
+        rendered_deleted = strip_ansi(sl.render(payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ main*", rendered_deleted)
+
+    def test_layer2_partial_line_over_64kb_switch_dual_watermarks_and_edge_cases(self) -> None:
+        main_repo = self.root / "bigrepo"
+        (main_repo / ".git").mkdir(parents=True)
+        (main_repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+        def make_wt(wt_name: str, branch: str, folder: str) -> Path:
+            wt_git = main_repo / ".git" / "worktrees" / wt_name
+            wt_git.mkdir(parents=True)
+            (wt_git / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
+            (wt_git / "commondir").write_text("../..\n", encoding="utf-8")
+            wt_d = self.root / folder
+            (wt_d / "src").mkdir(parents=True)
+            (wt_d / ".git").write_text(f"gitdir: {wt_git}\n", encoding="utf-8")
+            return wt_d
+
+        wt_a = make_wt("bigrepo-feat-a", "feat/a", "bigrepo-worktree/wt-a")
+        wt_b = make_wt("bigrepo-feat-b", "feat/b", "bigrepo-worktree/it's wt-b")
+
+        cid = "conv-edge-1"
+        brain_conv = self.data_dir / "brain" / cid
+        scratch = brain_conv / "scratch"
+        logs_dir = brain_conv / ".system_generated" / "logs"
+        scratch.mkdir(parents=True)
+        logs_dir.mkdir(parents=True)
+        transcript = logs_dir / "transcript.jsonl"
+        transcript_full = logs_dir / "transcript_full.jsonl"
+
+        payload = {
+            "artifactDirectoryPath": str(brain_conv / "artifacts"),
+            "transcript_path": str(transcript_full),  # statusline prefers compact transcript.jsonl sibling
+            "workspace": {"current_dir": str(main_repo)},
+            "model": {"display_name": "G4"},
+            "terminal_width": 120,
+        }
+
+        # 1. Partial non-newline-terminated JSONL line must NOT be dropped on next render (F17)
+        full_line_a = json.dumps(
+            {"step_index": 1, "tool_calls": [{"name": "edit_file", "args": {"Path": json.dumps(str(wt_a / "src" / "x.py"))}}]}
+        ) + "\n"
+        transcript.write_bytes(full_line_a[:40].encode("utf-8"))
+        transcript_full.write_text("x" * 1000 + "\n", encoding="utf-8")
+        self.assertEqual(sl.detect_worktree(payload, str(main_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("main", False))
+        # Now flush remainder of line
+        transcript.write_bytes(full_line_a.encode("utf-8"))
+        self.assertEqual(sl.detect_worktree(payload, str(main_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("feat/a", True))
+
+        # 2. label="name" and auto_prefix="" in Layer 2 (including cache hit)
+        cfg_name_nopfx = sl._deep_merge(sl.DEFAULT_CONFIG, {"worktree": {"label": "name", "auto_prefix": ""}})
+        rendered_np = strip_ansi(sl.render(payload, config=cfg_name_nopfx, settings={}, data_dir=self.data_dir))
+        self.assertIn("⎇ bigrepo-feat-a", rendered_np)
+        self.assertNotIn("~bigrepo-feat-a", rendered_np)
+
+        # 3. >64KB mid-line seek + worktree A -> worktree B switch + shell path regex edge cases (F18, T5)
+        padding_line = json.dumps({"step_index": 2, "content": "p" * 70_000}) + "\n"
+        switch_line = json.dumps(
+            {
+                "step_index": 3,
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": f'git -C "{wt_b}" status && cd {wt_a}&& true'}}
+                ],
+            }
+        ) + "\n"
+        with open(transcript, "a", encoding="utf-8") as fp:
+            fp.write(padding_line)
+            fp.write(switch_line)
+        # Reversed path extraction inspects wt_a first? Check that wt_b (apostrophe + spaces in double quotes) is extracted cleanly!
+        cands = sl._extract_candidate_paths_from_tool_call(
+            {"name": "run_command", "args": {"CommandLine": f'git -C "{wt_b}" status'}}
+        )
+        self.assertIn(str(wt_b), cands)
+        self.assertIn(str(wt_a), sl._extract_candidate_paths_from_tool_call({"name": "run_command", "args": {"CommandLine": f"cd {wt_a}&& make"}}))
+        self.assertIn(str(wt_a), sl._extract_candidate_paths_from_tool_call({"name": "run_command", "args": {"CommandLine": f"git -C{wt_a} status"}}))
+        self.assertIn(str(wt_a), sl._extract_candidate_paths_from_tool_call({"name": "run_command", "args": {"CommandLine": f"PATH={wt_a}:/usr/bin make"}}))
+        self.assertIn(str(wt_b / "run.sh"), sl._extract_candidate_paths_from_tool_call({"name": "run_command", "args": {"CommandLine": f'"{wt_b}/run.sh"'}}))
+
+        # Append a clean wt_b-only tool call past >64KB padding and verify A -> B switch
+        with open(transcript, "a", encoding="utf-8") as fp:
+            fp.write(
+                json.dumps(
+                    {"step_index": 4, "tool_calls": [{"name": "run_command", "args": {"CommandLine": f'git -C "{wt_b}" status'}}]}
+                )
+                + "\n"
+            )
+        self.assertEqual(sl.detect_worktree(payload, str(main_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("feat/b", True))
+
+        # 4. Dual per-file exit_transcript_offsets: transcript_full.jsonl offset > transcript.jsonl size MUST NOT blind Layer 2 (F15!)
+        (scratch / "worktree.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "state": "exited",
+                    "common_dir": str(main_repo / ".git"),
+                    "exit_transcript_offset": transcript.stat().st_size,
+                    "exit_transcript_offsets": {
+                        "transcript.jsonl": transcript.stat().st_size,
+                        "transcript_full.jsonl": transcript.stat().st_size * 5,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(sl.detect_worktree(payload, str(main_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("main", False))
+        # Append 1 tiny line to transcript.jsonl -> immediately detected because compact watermark is matched!
+        with open(transcript, "a", encoding="utf-8") as fp:
+            fp.write(
+                json.dumps({"step_index": 5, "tool_calls": [{"name": "edit_file", "args": {"Path": json.dumps(str(wt_a / "src" / "y.py"))}}]})
+                + "\n"
+            )
+        self.assertEqual(sl.detect_worktree(payload, str(main_repo), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("feat/a", True))
+
+        # 5. Cross-repo exited watermark does NOT suppress another repo (F19e)
+        other_repo = self.root / "other2"
+        (other_repo / ".git").mkdir(parents=True)
+        (other_repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        _, wm = sl._load_session_worktree(scratch, other_repo / ".git", "branch", transcript)
+        self.assertEqual(wm, 0)
+
+        # 6. NUL bytes in current_dir or transcript_path never crash (F19a)
+        bad_payload = {"workspace": {"current_dir": "/tmp/bad\x00dir/sub"}, "transcript_path": "/tmp/bad\x00.jsonl", "terminal_width": 80}
+        out_bad = sl.render(bad_payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir)
+        self.assertNotIn("\n", out_bad)
+
+        # 7. Symlinked main repo path resolves Layer 1 cleanly
+        repo_sym = self.root / "bigrepo-link"
+        repo_sym.symlink_to(main_repo)
+        (scratch / "worktree.json").write_text(
+            json.dumps({"version": 1, "state": "active", "main_dir": str(main_repo), "worktree_path": str(wt_a), "branch": "feat/a"}),
+            encoding="utf-8",
+        )
+        sym_payload = dict(payload, workspace={"current_dir": str(repo_sym)})
+        self.assertEqual(sl.detect_worktree(sym_payload, str(repo_sym), cfg=sl.DEFAULT_CONFIG, data_dir=self.data_dir), ("feat/a", True))
+
+        # 8. Round-2 fixes: watermark non-leakage, 0-byte compact fallback, and escaped/compound command paths
+        self.assertEqual(
+            sl._resolve_exit_watermark(
+                {"exit_transcript_offset": 50_000, "exit_transcript_offsets": {"transcript_full.jsonl": 50_000}},
+                transcript,
+            ),
+            0,
+        )
+        # Empty compact transcript.jsonl falls back to non-empty transcript_full.jsonl
+        empty_logs = self.root / "empty-logs"
+        empty_logs.mkdir()
+        (empty_logs / "transcript.jsonl").write_text("", encoding="utf-8")
+        (empty_logs / "transcript_full.jsonl").write_text('{"step_index":0}\n', encoding="utf-8")
+        self.assertEqual(sl._select_preferred_transcript(empty_logs).name, "transcript_full.jsonl")
+
+        # Nested escaped quotes, compound quoted cmd starting with '/', and backslash-escaped space
+        self.assertIn(
+            str(wt_a),
+            sl._extract_candidate_paths_from_tool_call(
+                {"name": "run_command", "args": {"CommandLine": f'sh -c "git -C \\"{wt_a}\\" status"'}}
+            ),
+        )
+        self.assertIn(
+            str(wt_a),
+            sl._extract_candidate_paths_from_tool_call(
+                {"name": "run_command", "args": {"CommandLine": f'bash -c "/bin/echo hi && cd {wt_a} && make"'}}
+            ),
+        )
+        escaped_space_wt = str(wt_b).replace("'", "\\'").replace(" ", "\\ ")
+        self.assertIn(
+            str(wt_b),
+            sl._extract_candidate_paths_from_tool_call(
+                {"name": "run_command", "args": {"CommandLine": f"cd {escaped_space_wt} && make"}}
+            ),
+        )
 
     def test_permission_cycle_mode_default_fallback_and_colors(self) -> None:
         cfg = sl._deep_merge(sl.DEFAULT_CONFIG, {})
