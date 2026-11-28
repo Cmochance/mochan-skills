@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""Claude Code-style usage & model distribution renderer for Antigravity CLI (agy)."""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import sqlite3
+import sys
+import termios
+import tty
+import unicodedata
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+C_TITLE = "\033[38;5;111m"
+C_MUTED = "\033[38;5;244m"
+C_SEP = "\033[38;5;240m"
+C_TEXT = "\033[38;5;252m"
+C_GREEN = "\033[38;5;114m"
+C_AMBER = "\033[38;5;215m"
+C_RED = "\033[38;5;203m"
+C_SKY = "\033[38;5;117m"
+C_TEAL = "\033[38;5;79m"
+C_PURPLE = "\033[38;5;141m"
+
+HEAT_LEVELS = (
+    "\033[38;5;238m",  # 0: empty
+    "\033[38;5;22m",   # 1: low
+    "\033[38;5;28m",   # 2: medium-low
+    "\033[38;5;34m",   # 3: medium-high
+    "\033[38;5;114m",  # 4: high
+)
+
+MODEL_COLORS = (
+    "\033[38;5;114m",  # green
+    "\033[38;5;117m",  # sky
+    "\033[38;5;141m",  # purple
+    "\033[38;5;215m",  # amber
+    "\033[38;5;79m",   # teal
+    "\033[38;5;204m",  # pink
+    "\033[38;5;221m",  # yellow
+    "\033[38;5;111m",  # blue
+)
+
+CACHE_VERSION = 1
+METRICS = ("tokens", "all-tokens", "messages", "steps", "tools")
+METRIC_LABELS = {
+    "tokens": "Tokens (In+Out)",
+    "all-tokens": "All Tokens (In+Cache+Out)",
+    "messages": "User Messages",
+    "steps": "Model Steps",
+    "tools": "Tool Calls",
+}
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(s: str) -> str:
+    """Remove ANSI CSI escape sequences from a string."""
+    return ANSI_RE.sub("", s)
+
+
+def char_display_width(ch: str) -> int:
+    """Return terminal cell width of a single Unicode character."""
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def visible_len(s: str) -> int:
+    """Return visible terminal column width of a string, ignoring ANSI sequences."""
+    return sum(char_display_width(ch) for ch in strip_ansi(s))
+
+
+def truncate_text(text: str, max_w: int) -> str:
+    """Truncate plain text to at most max_w display columns, adding ellipsis if needed."""
+    if max_w <= 0:
+        return ""
+    if visible_len(text) <= max_w:
+        return text
+    if max_w == 1:
+        return "…"
+    out: list[str] = []
+    used = 0
+    limit = max_w - 1
+    for ch in text:
+        cw = char_display_width(ch)
+        if used + cw > limit:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out) + "…"
+
+
+def pad_text(text: str, width: int) -> str:
+    """Truncate or right-pad plain text to exact display column width."""
+    t = truncate_text(text, width)
+    rem = max(0, width - visible_len(t))
+    return t + (" " * rem)
+
+
+def truncate_ansi_line(line: str, max_w: int) -> str:
+    """Safely truncate an ANSI-styled line to at most max_w visible columns without breaking escapes."""
+    if max_w <= 0:
+        return ""
+    if visible_len(line) <= max_w:
+        return line
+    out: list[str] = []
+    used = 0
+    has_ansi = False
+    pos = 0
+    limit = max(0, max_w - 1) if max_w > 1 else max_w
+    while pos < len(line):
+        m = ANSI_RE.match(line, pos)
+        if m:
+            out.append(m.group(0))
+            has_ansi = True
+            pos = m.end()
+            continue
+        ch = line[pos]
+        cw = char_display_width(ch)
+        if used + cw > limit:
+            if max_w > 1:
+                out.append("…")
+            break
+        out.append(ch)
+        used += cw
+        pos += 1
+    if has_ansi:
+        out.append(RESET)
+    return "".join(out)
+
+
+def wrap_segments(
+    segments: list[str],
+    effective_w: int,
+    indent: str = "  ",
+    sep: str = "   ",
+) -> list[str]:
+    """Pack ANSI-styled segments into lines whose visible width stays within effective_w."""
+    indent_w = visible_len(indent)
+    sep_w = visible_len(sep)
+    result: list[str] = []
+    cur_parts: list[str] = []
+    cur_w = indent_w
+
+    for seg in segments:
+        seg_w = visible_len(seg)
+        if not cur_parts:
+            cur_parts.append(seg)
+            cur_w = indent_w + seg_w
+        elif cur_w + sep_w + seg_w <= effective_w:
+            cur_parts.append(sep)
+            cur_parts.append(seg)
+            cur_w += sep_w + seg_w
+        else:
+            result.append(truncate_ansi_line(indent + "".join(cur_parts), effective_w))
+            cur_parts = [seg]
+            cur_w = indent_w + seg_w
+    if cur_parts:
+        result.append(truncate_ansi_line(indent + "".join(cur_parts), effective_w))
+    return result
+
+
+def wrap_plain_line(
+    text: str,
+    effective_w: int,
+    indent: str = "  ",
+    style: str = "",
+) -> list[str]:
+    """Wrap plain text by words onto lines <= effective_w, applying optional ANSI style per line."""
+    max_body = max(1, effective_w - visible_len(indent))
+    if visible_len(text) <= max_body:
+        return [f"{indent}{style}{text}{RESET}" if style else f"{indent}{text}"]
+    words = text.split(" ")
+    out: list[str] = []
+    cur = ""
+    for word in words:
+        if not cur:
+            cur = word if visible_len(word) <= max_body else truncate_text(word, max_body)
+        elif visible_len(cur) + 1 + visible_len(word) <= max_body:
+            cur = f"{cur} {word}"
+        else:
+            out.append(f"{indent}{style}{cur}{RESET}" if style else f"{indent}{cur}")
+            cur = word if visible_len(word) <= max_body else truncate_text(word, max_body)
+    if cur:
+        out.append(f"{indent}{style}{cur}{RESET}" if style else f"{indent}{cur}")
+    return out
+
+
+def render_colored_cells(cells: list[tuple[str | None, str]]) -> str:
+    """Render (ansi_color, glyph) cells separated by single spaces with run-length ANSI dedup."""
+    end = len(cells)
+    while end > 0 and cells[end - 1][0] is None:
+        end -= 1
+    if end == 0:
+        return ""
+
+    parts: list[str] = []
+    cur_color: str | None = None
+    for idx in range(end):
+        color, glyph = cells[idx]
+        sep = " " if idx < end - 1 else ""
+        if color is None:
+            parts.append(glyph + sep)
+            continue
+        if color != cur_color:
+            parts.append(color)
+            cur_color = color
+        parts.append(glyph + sep)
+    if cur_color is not None:
+        parts.append(RESET)
+    return "".join(parts)
+
+
+def render_bar(filled: int, total: int, fill_color: str) -> str:
+    """Render a progress bar with minimal ANSI transitions."""
+    filled = max(0, min(total, filled))
+    empty = total - filled
+    parts: list[str] = []
+    if filled > 0:
+        parts.append(f"{fill_color}{'█' * filled}")
+    if empty > 0:
+        parts.append(f"{C_SEP}{'░' * empty}")
+    if parts:
+        parts.append(RESET)
+    return "".join(parts)
+
+
+def resolve_effective_width(width: int | None = None) -> int:
+    """Resolve effective render width from explicit width, COLUMNS, or terminal size."""
+    if width is not None:
+        return max(14, int(width))
+    raw_w = shutil.get_terminal_size((80, 24)).columns
+    if raw_w <= 0:
+        raw_w = 80
+    if raw_w >= 36:
+        return raw_w - 4
+    return max(14, min(raw_w, max(32, raw_w - 4)))
+
+
+def positive_int(value: str) -> int:
+    """Argparse type validator for strictly positive integers."""
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
+
+
+def default_data_dir() -> Path:
+    """Resolve the Antigravity CLI data directory."""
+    env = os.environ.get("AGY_DATA_DIR", "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".gemini" / "antigravity-cli"
+
+
+def format_num(n: int | float) -> str:
+    """Format large counts compactly (e.g., 1.2K, 34.5M, 1.1B)."""
+    val = float(n)
+    for unit, div in (("B", 1_000_000_000.0), ("M", 1_000_000.0), ("K", 1_000.0)):
+        if abs(val) >= div:
+            s = f"{val / div:.1f}"
+            return (s[:-2] if s.endswith(".0") else s) + unit
+    return str(int(round(val)))
+
+
+def normalize_model_name(raw: str, exact: bool = False) -> str:
+    """Map raw model IDs to clean model families unless exact=True."""
+    if exact or not raw:
+        return raw or "unknown"
+    lower = raw.lower()
+    prefixes = (
+        ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+        ("gemini-4-carbon", "Gemini 4 Carbon"),
+        ("gemini-4-neon", "Gemini 4 Neon"),
+        ("gemini-4-argon", "Gemini 4 Argon"),
+        ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+        ("gemini-pro-orchestrator", "Orchestrator"),
+        ("gemini-flash-worker", "Worker Flash"),
+    )
+    for prefix, label in prefixes:
+        if lower.startswith(prefix):
+            return label
+    if "claude-opus" in lower:
+        return "Claude Opus"
+    if "claude-sonnet" in lower:
+        return "Claude Sonnet"
+    return raw.replace("-", " ").title()
+
+
+def parse_local_date(iso_ts: object) -> str | None:
+    """Convert an ISO-8601 timestamp string to local YYYY-MM-DD."""
+    if not isinstance(iso_ts, str) or not iso_ts.strip():
+        return None
+    raw = iso_ts.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.date().isoformat()
+    return dt.astimezone().date().isoformat()
+
+
+def parse_transcript_file(path: Path) -> dict[str, dict]:
+    """Parse a single transcript.jsonl into per-date aggregated metrics."""
+    days: dict[str, dict] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                day = parse_local_date(entry.get("created_at"))
+                if not day:
+                    continue
+                day_rec = days.setdefault(day, {"__messages__": 0, "models": {}})
+                etype = entry.get("type")
+                if etype == "USER_INPUT":
+                    day_rec["__messages__"] += 1
+                elif etype == "PLANNER_RESPONSE":
+                    model = entry.get("model")
+                    if not isinstance(model, str) or not model.strip():
+                        continue
+                    m_rec = day_rec["models"].setdefault(
+                        model.strip(),
+                        {"steps": 0, "in": 0, "cache": 0, "out": 0, "tools": 0},
+                    )
+                    m_rec["steps"] += 1
+                    m_rec["in"] += int(entry.get("input_tokens") or 0)
+                    m_rec["cache"] += int(entry.get("cache_read_tokens") or 0)
+                    m_rec["out"] += int(entry.get("output_tokens") or 0)
+                    tc = entry.get("tool_calls")
+                    if isinstance(tc, list):
+                        m_rec["tools"] += len(tc)
+    except OSError:
+        return {}
+    return days
+
+
+def load_cache(cache_path: Path) -> dict:
+    """Load incremental transcript parse cache if valid."""
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
+            files = data.get("files")
+            if isinstance(files, dict):
+                return files
+    except Exception:
+        pass
+    return {}
+
+
+def save_cache(cache_path: Path, files: dict) -> None:
+    """Atomically persist incremental transcript parse cache."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        payload = {"version": CACHE_VERSION, "files": files}
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+
+def load_conversation_metadata(data_dir: Path) -> dict[str, dict]:
+    """Read workspace_uris and parent info from conversation_summaries.db (read-only)."""
+    db_path = data_dir / "conversation_summaries.db"
+    if not db_path.exists():
+        return {}
+    meta: dict[str, dict] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = conn.execute(
+                "SELECT conversation_id, workspace_uris, parent_conversation_id, nesting_depth "
+                "FROM conversation_summaries"
+            )
+            for cid, ws, parent_id, depth in cur:
+                meta[str(cid)] = {
+                    "workspace_uris": str(ws or ""),
+                    "is_subagent": bool(parent_id) or int(depth or 0) > 0,
+                }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return meta
+
+
+def collect_usage(
+    data_dir: Path,
+    exclude_subagents: bool = False,
+    project_filter: str = "",
+    exact_models: bool = False,
+    days_limit: int | None = None,
+) -> dict:
+    """Collect and aggregate usage metrics across all local transcripts."""
+    brain_dir = data_dir / "brain"
+    cache_path = data_dir / "cache" / "usage_stats_cache.json"
+    cached_files = load_cache(cache_path)
+    new_cache: dict[str, dict] = {}
+    cache_dirty = False
+
+    conv_meta = load_conversation_metadata(data_dir)
+    proj_q = project_filter.strip().lower()
+
+    daily: dict[str, dict] = defaultdict(
+        lambda: {"messages": 0, "steps": 0, "in": 0, "cache": 0, "out": 0, "tools": 0, "models": defaultdict(lambda: [0, 0, 0, 0, 0])}
+    )
+    model_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])  # steps, in, cache, out, tools
+    sessions_count = 0
+
+    cutoff_str = ""
+    if days_limit and days_limit > 0:
+        cutoff_str = (date.today() - timedelta(days=days_limit - 1)).isoformat()
+
+    if brain_dir.is_dir():
+        for conv_dir in sorted(brain_dir.iterdir()):
+            if not conv_dir.is_dir():
+                continue
+            cid = conv_dir.name
+            meta = conv_meta.get(cid)
+            if exclude_subagents and meta and meta["is_subagent"]:
+                continue
+            if proj_q and (not meta or proj_q not in meta["workspace_uris"].lower()):
+                continue
+
+            t_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
+            if not t_path.is_file():
+                continue
+            try:
+                st = t_path.stat()
+            except OSError:
+                continue
+
+            rel_key = cid
+            prev = cached_files.get(rel_key)
+            if (
+                isinstance(prev, dict)
+                and prev.get("mtime_ns") == st.st_mtime_ns
+                and prev.get("size") == st.st_size
+                and isinstance(prev.get("days"), dict)
+            ):
+                parsed_days = prev["days"]
+            else:
+                parsed_days = parse_transcript_file(t_path)
+                cache_dirty = True
+
+            new_cache[rel_key] = {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+                "days": parsed_days,
+            }
+
+            if parsed_days:
+                matched_any = False
+                for d_str, d_rec in parsed_days.items():
+                    if cutoff_str and d_str < cutoff_str:
+                        continue
+                    matched_any = True
+                    target = daily[d_str]
+                    target["messages"] += int(d_rec.get("__messages__") or 0)
+                    for raw_m, m_rec in (d_rec.get("models") or {}).items():
+                        m_name = normalize_model_name(raw_m, exact=exact_models)
+                        s = int(m_rec.get("steps") or 0)
+                        i = int(m_rec.get("in") or 0)
+                        c = int(m_rec.get("cache") or 0)
+                        o = int(m_rec.get("out") or 0)
+                        t = int(m_rec.get("tools") or 0)
+                        target["steps"] += s
+                        target["in"] += i
+                        target["cache"] += c
+                        target["out"] += o
+                        target["tools"] += t
+                        tm = target["models"][m_name]
+                        tm[0] += s
+                        tm[1] += i
+                        tm[2] += c
+                        tm[3] += o
+                        tm[4] += t
+                        gm = model_totals[m_name]
+                        gm[0] += s
+                        gm[1] += i
+                        gm[2] += c
+                        gm[3] += o
+                        gm[4] += t
+                if matched_any:
+                    sessions_count += 1
+
+    if cache_dirty or len(new_cache) != len(cached_files):
+        save_cache(cache_path, new_cache)
+
+    return {
+        "daily": dict(daily),
+        "models": {k: list(v) for k, v in model_totals.items()},
+        "sessions": sessions_count,
+    }
+
+
+def metric_value_for_day(d_rec: dict, metric: str) -> int:
+    """Extract the scalar metric value from a day record."""
+    if metric == "tokens":
+        return d_rec["in"] + d_rec["out"]
+    if metric == "all-tokens":
+        return d_rec["in"] + d_rec["cache"] + d_rec["out"]
+    if metric == "messages":
+        return d_rec["messages"]
+    if metric == "steps":
+        return d_rec["steps"]
+    if metric == "tools":
+        return d_rec["tools"]
+    return d_rec["in"] + d_rec["out"]
+
+
+def metric_value_for_model(m_vals: list[int], metric: str) -> int:
+    """Extract the scalar metric value from [steps, in, cache, out, tools]."""
+    s, i, c, o, t = m_vals
+    if metric == "tokens":
+        return i + o
+    if metric == "all-tokens":
+        return i + c + o
+    if metric == "steps":
+        return s
+    if metric == "tools":
+        return t
+    return i + o
+
+
+def compute_streaks(daily: dict[str, dict], today: date) -> tuple[int, int, str, int]:
+    """Compute (current_streak, longest_streak, busiest_day, busiest_tokens)."""
+    active_dates = sorted(
+        date.fromisoformat(d)
+        for d, rec in daily.items()
+        if (rec["in"] + rec["out"] + rec["steps"] + rec["messages"]) > 0
+    )
+    if not active_dates:
+        return 0, 0, "-", 0
+
+    active_set = set(active_dates)
+    cur = 0
+    probe = today if today in active_set else (today - timedelta(days=1))
+    while probe in active_set:
+        cur += 1
+        probe -= timedelta(days=1)
+
+    longest = 0
+    run = 0
+    prev: date | None = None
+    for d in active_dates:
+        if prev and (d - prev).days == 1:
+            run += 1
+        else:
+            run = 1
+        longest = max(longest, run)
+        prev = d
+
+    busiest_day = max(daily.keys(), key=lambda k: daily[k]["in"] + daily[k]["out"])
+    busiest_tok = daily[busiest_day]["in"] + daily[busiest_day]["out"]
+    return cur, longest, busiest_day, busiest_tok
+
+
+def quantile_thresholds(values: list[int]) -> list[int]:
+    """Compute 3 quantile cutpoints [q25, q50, q75] over positive values."""
+    pos = sorted(v for v in values if v > 0)
+    if not pos:
+        return [1, 2, 3]
+    n = len(pos)
+    return [
+        pos[min(n - 1, int(n * 0.25))],
+        pos[min(n - 1, int(n * 0.50))],
+        pos[min(n - 1, int(n * 0.75))],
+    ]
+
+
+def heat_level(val: int, cuts: list[int]) -> int:
+    """Map a numeric value to heat level 0..4."""
+    if val <= 0:
+        return 0
+    if val <= cuts[0]:
+        return 1
+    if val <= cuts[1]:
+        return 2
+    if val <= cuts[2]:
+        return 3
+    return 4
+
+
+def load_quota_snapshot(data_dir: Path) -> dict | None:
+    """Load cached quota snapshot written by statusline.py if present."""
+    snap_path = data_dir / "cache" / "quota_snapshot.json"
+    try:
+        data = json.loads(snap_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_pct(bucket: dict) -> int | None:
+    if bucket.get("disabled") is True:
+        return None
+    frac = bucket.get("remaining_fraction")
+    if not isinstance(frac, bool) and isinstance(frac, (int, float)) and math.isfinite(float(frac)):
+        return int(round(max(0.0, min(1.0, float(frac))) * 100))
+    pct = bucket.get("remaining_percentage")
+    if not isinstance(pct, bool) and isinstance(pct, (int, float)) and math.isfinite(float(pct)):
+        return int(round(max(0.0, min(100.0, float(pct)))))
+    return None
+
+
+def _extract_amount(bucket: dict) -> float | None:
+    if bucket.get("disabled") is True:
+        return None
+    amt = bucket.get("remaining_amount")
+    if not isinstance(amt, bool) and isinstance(amt, (int, float)) and math.isfinite(float(amt)):
+        return float(amt)
+    return None
+
+
+def _format_countdown(seconds: object) -> str:
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(float(seconds)) or seconds <= 0:
+        return ""
+    mins = int(seconds // 60)
+    days, rem_m = divmod(mins, 1440)
+    hours, mins_only = divmod(rem_m, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {mins_only}m"
+    return f"{mins_only}m"
+
+
+def render_quota_section(snapshot: dict | None, effective_w: int | None = None) -> list[str]:
+    """Render compact 5h/Weekly quota bars (or remaining_amount rows) if quota_snapshot.json is available."""
+    if not snapshot or not snapshot.get("quota"):
+        return []
+    quota = snapshot["quota"]
+    buckets: list[tuple[str, dict]] = []
+    if isinstance(quota, dict):
+        if _extract_pct(quota) is not None or _extract_amount(quota) is not None:
+            buckets.append(("quota", quota))
+        else:
+            for k, v in quota.items():
+                if isinstance(v, dict) and (_extract_pct(v) is not None or _extract_amount(v) is not None):
+                    buckets.append((str(k), v))
+    elif isinstance(quota, list):
+        for item in quota:
+            if isinstance(item, dict) and (_extract_pct(item) is not None or _extract_amount(item) is not None):
+                name = str(item.get("name") or item.get("id") or item.get("bucket") or "")
+                buckets.append((name, item))
+    if not buckets:
+        return []
+
+    updated = str(snapshot.get("updated_at") or "")
+    age_str = ""
+    if updated:
+        try:
+            dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            mins = max(0, int((datetime.now().astimezone() - dt.astimezone()).total_seconds() // 60))
+            age_str = f" · {mins}m ago" if mins < 60 else f" · {mins // 60}h ago"
+        except Exception:
+            pass
+
+    header_title = f"  {BOLD}{C_TEXT}Quota Snapshot{RESET}"
+    header_age = f"{C_MUTED}{age_str}{RESET}" if age_str else ""
+    if effective_w is None or visible_len(header_title) + visible_len(header_age) <= effective_w:
+        lines = [f"{header_title}{header_age}"]
+    else:
+        lines = [truncate_ansi_line(header_title, effective_w)]
+        age_clean = age_str.lstrip(" ·")
+        if age_clean:
+            lines.append(truncate_ansi_line(f"  {C_MUTED}{age_clean}{RESET}", effective_w))
+
+    prepared_pct: list[tuple[str, int, str]] = []
+    prepared_amt: list[tuple[str, float, str]] = []
+    for name, b in sorted(buckets, key=lambda x: x[0].lower()):
+        cd = _format_countdown(b.get("reset_in_seconds"))
+        pct = _extract_pct(b)
+        if pct is not None:
+            prepared_pct.append((name, pct, cd))
+            continue
+        amt = _extract_amount(b)
+        if amt is not None:
+            prepared_amt.append((name, amt, cd))
+
+    max_cd_len = max((len(f" ({cd})") if cd else 0 for _, _, cd in prepared_pct), default=0)
+
+    if effective_w is None:
+        one_line = True
+        name_w = 22
+        bar_w = 18
+    elif effective_w >= 10 + 14 + 8 + max_cd_len:
+        one_line = True
+        avail = effective_w - 10 - max_cd_len
+        name_w = min(22, max(14, avail - 18))
+        bar_w = min(18, max(8, avail - name_w))
+    else:
+        one_line = False
+        name_w = max(8, effective_w - 2)
+        bar_w = 18
+
+    for name, pct, cd in prepared_pct:
+        color = C_GREEN if pct >= 50 else (C_AMBER if pct >= 20 else C_RED)
+        cd_txt = f" {C_MUTED}({cd}){RESET}" if cd else ""
+        cd_len = len(f" ({cd})") if cd else 0
+        if one_line:
+            filled = int(round((pct / 100.0) * bar_w))
+            bar = render_bar(filled, bar_w, color)
+            lines.append(f"  {C_TEXT}{pad_text(name, name_w)}{RESET} [{bar}] {color}{pct:>3}%{RESET}{cd_txt}")
+        else:
+            lines.append(f"  {C_TEXT}{truncate_text(name, name_w)}{RESET}")
+            row_bar_w = min(18, effective_w - 9 - cd_len)
+            if row_bar_w >= 6:
+                filled = int(round((pct / 100.0) * row_bar_w))
+                bar = render_bar(filled, row_bar_w, color)
+                lines.append(f"  [{bar}] {color}{pct:>3}%{RESET}{cd_txt}")
+            else:
+                fallback_bar_w = max(4, min(18, effective_w - 9))
+                filled = int(round((pct / 100.0) * fallback_bar_w))
+                bar = render_bar(filled, fallback_bar_w, color)
+                lines.append(f"  [{bar}] {color}{pct:>3}%{RESET}")
+                if cd:
+                    lines.append(truncate_ansi_line(f"  {C_MUTED}({cd}){RESET}", effective_w))
+
+    for name, amt, cd in prepared_amt:
+        color = C_GREEN if amt > 0 else C_RED
+        amt_txt = str(int(amt)) if amt.is_integer() else f"{amt:.2f}".rstrip("0").rstrip(".")
+        cd_txt = f" {C_MUTED}({cd}){RESET}" if cd else ""
+        row = f"  {C_TEXT}{pad_text(name, name_w)}{RESET} {color}{amt_txt}{RESET}{cd_txt}"
+        lines.append(truncate_ansi_line(row, effective_w) if effective_w is not None else row)
+
+    return lines
+
+
+def render_report(
+    stats: dict,
+    metric: str = "tokens",
+    weeks: int = 26,
+    by_model: bool = False,
+    exact_models: bool = False,
+    exclude_subagents: bool = False,
+    quota_snapshot: dict | None = None,
+    interactive_hint: bool = False,
+    width: int | None = None,
+) -> str:
+    """Render the full terminal stats report."""
+    effective_w = resolve_effective_width(width)
+    daily = stats["daily"]
+    models = stats["models"]
+    today = date.today()
+
+    tot_in = sum(r["in"] for r in daily.values())
+    tot_cache = sum(r["cache"] for r in daily.values())
+    tot_out = sum(r["out"] for r in daily.values())
+    tot_msgs = sum(r["messages"] for r in daily.values())
+    tot_steps = sum(r["steps"] for r in daily.values())
+    tot_tools = sum(r["tools"] for r in daily.values())
+    active_days = sum(1 for r in daily.values() if (r["in"] + r["out"] + r["steps"]) > 0)
+    cur_streak, max_streak, busiest_day, busiest_tok = compute_streaks(daily, today)
+
+    lines: list[str] = []
+    mode_tags = []
+    if exact_models:
+        mode_tags.append("Exact Models")
+    if exclude_subagents:
+        mode_tags.append("No Subagents")
+    tag_suffix = f" · {' · '.join(mode_tags)}" if mode_tags else ""
+
+    title_plain = "ANTIGRAVITY USAGE & ACTIVITY"
+    meta_plain = f"({METRIC_LABELS.get(metric, metric)}{tag_suffix})"
+    if visible_len(title_plain) + 1 + visible_len(meta_plain) <= effective_w:
+        lines.append(f"{BOLD}{C_TITLE}{title_plain}{RESET} {C_MUTED}{meta_plain}{RESET}")
+    else:
+        lines.append(f"{BOLD}{C_TITLE}{truncate_text(title_plain, effective_w)}{RESET}")
+        lines.extend(wrap_plain_line(meta_plain, effective_w, indent="", style=C_MUTED))
+    lines.append("")
+
+    tok_main = f"{C_TEXT}Tokens:{RESET} {BOLD}{C_GREEN}{format_num(tot_in + tot_out)}{RESET}"
+    tok_detail_plain = f"(In {format_num(tot_in)} · Out {format_num(tot_out)} · Cache {format_num(tot_cache)})"
+    tok_detail = f"{C_MUTED}{tok_detail_plain}{RESET}"
+    sess_seg = f"{C_TEXT}Sessions:{RESET} {BOLD}{stats['sessions']}{RESET}"
+    active_seg = f"{C_TEXT}Active:{RESET} {BOLD}{active_days}d{RESET}"
+    tok_combined = f"{tok_main} {tok_detail}"
+    if visible_len(tok_combined) + 2 <= effective_w:
+        lines.extend(wrap_segments([tok_combined, sess_seg, active_seg], effective_w))
+    else:
+        lines.extend(wrap_segments([tok_main], effective_w))
+        lines.extend(wrap_plain_line(tok_detail_plain, effective_w, indent="  ", style=C_MUTED))
+        lines.extend(wrap_segments([sess_seg, active_seg], effective_w))
+
+    streak_seg = f"{C_TEXT}Streak:{RESET} {BOLD}{cur_streak}d{RESET} {C_MUTED}(Max {max_streak}d){RESET}"
+    busiest_main = f"{C_TEXT}Busiest:{RESET} {BOLD}{busiest_day}{RESET}"
+    busiest_detail_plain = f"({format_num(busiest_tok)} in/out)"
+    busiest_combined = f"{busiest_main} {C_MUTED}{busiest_detail_plain}{RESET}"
+    msgs_seg = f"{C_TEXT}Msgs/Tools:{RESET} {tot_msgs}/{tot_tools}"
+    if visible_len(busiest_combined) + 2 <= effective_w:
+        streak_segs = [streak_seg, busiest_combined, msgs_seg]
+    else:
+        streak_segs = [streak_seg, busiest_main, f"{C_MUTED}{busiest_detail_plain}{RESET}", msgs_seg]
+    lines.extend(wrap_segments(streak_segs, effective_w))
+    lines.append("")
+
+    # Fit week count to effective width: "  Mon  " (7) + vis_weeks*2 - 1 <= effective_w
+    max_fit_weeks = max(4, (effective_w - 6) // 2)
+    vis_weeks = max(1, min(weeks, max_fit_weeks))
+    # Align grid to Monday..Sunday
+    start_of_this_week = today - timedelta(days=today.weekday())
+    grid_start = start_of_this_week - timedelta(weeks=vis_weeks - 1)
+
+    grid_vals: list[int] = []
+    for w in range(vis_weeks):
+        for dow in range(7):
+            d = grid_start + timedelta(days=w * 7 + dow)
+            if d <= today:
+                rec = daily.get(d.isoformat())
+                grid_vals.append(metric_value_for_day(rec, metric) if rec else 0)
+    cuts = quantile_thresholds(grid_vals)
+
+    legend = (
+        f"{C_MUTED}Less {HEAT_LEVELS[0]}▪ {HEAT_LEVELS[1]}■ {HEAT_LEVELS[2]}■ "
+        f"{HEAT_LEVELS[3]}■ {HEAT_LEVELS[4]}■ {C_MUTED}More{RESET}"
+    )
+    heatmap_title = f"  {BOLD}{C_TEXT}Activity Heatmap{RESET}"
+    heatmap_range = f"{C_MUTED}(Last {vis_weeks}w){RESET}"
+    heatmap_header = f"{heatmap_title} {heatmap_range}"
+    if visible_len(heatmap_header) + 3 + visible_len(legend) <= effective_w:
+        lines.append(f"{heatmap_header}   {legend}")
+    else:
+        if visible_len(heatmap_header) <= effective_w:
+            lines.append(heatmap_header)
+        else:
+            lines.append(truncate_ansi_line(heatmap_title, effective_w))
+            lines.append(truncate_ansi_line(f"  {heatmap_range}", effective_w))
+        if 2 + visible_len(legend) <= effective_w:
+            lines.append(f"  {legend}")
+        elif visible_len(legend) <= effective_w:
+            lines.append(legend)
+        else:
+            compact_legend = (
+                f"{HEAT_LEVELS[0]}▪ {HEAT_LEVELS[1]}■ {HEAT_LEVELS[2]}■ "
+                f"{HEAT_LEVELS[3]}■ {HEAT_LEVELS[4]}■{RESET}"
+            )
+            lines.append(f"  {compact_legend}" if 2 + visible_len(compact_legend) <= effective_w else compact_legend)
+
+    row_labels = ("Mon", "   ", "Wed", "   ", "Fri", "   ", "Sun")
+    for dow in range(7):
+        cell_specs: list[tuple[str | None, str]] = []
+        for w in range(vis_weeks):
+            d = grid_start + timedelta(days=w * 7 + dow)
+            if d > today:
+                cell_specs.append((None, " "))
+                continue
+            rec = daily.get(d.isoformat())
+            val = metric_value_for_day(rec, metric) if rec else 0
+            lvl = heat_level(val, cuts)
+            ch = "▪" if lvl == 0 else "■"
+            cell_specs.append((HEAT_LEVELS[lvl], ch))
+        cells_str = render_colored_cells(cell_specs)
+        lbl = row_labels[dow]
+        if cells_str:
+            prefix = f"  {C_MUTED}{lbl}{RESET}  " if lbl.strip() else "       "
+            lines.append(f"{prefix}{cells_str}")
+        else:
+            lines.append(f"  {C_MUTED}{lbl}{RESET}" if lbl.strip() else "")
+
+    # Month labels along bottom
+    max_month_cols = min(vis_weeks * 2 - 1, max(0, effective_w - 7))
+    month_row = [" "] * max_month_cols
+    last_month = -1
+    last_written_w = -1
+    next_free = 0
+    for w in range(vis_weeks):
+        d = grid_start + timedelta(days=w * 7)
+        if d.month != last_month:
+            m_lbl = d.strftime("%b")
+            col = w * 2
+            if col + len(m_lbl) <= max_month_cols:
+                if col < next_free and last_written_w == 0:
+                    for idx in range(min(3, max_month_cols)):
+                        month_row[idx] = " "
+                if col >= next_free or last_written_w == 0:
+                    for idx, ch in enumerate(m_lbl):
+                        month_row[col + idx] = ch
+                    next_free = col + len(m_lbl) + 1
+                    last_written_w = w
+            last_month = d.month
+    month_str = "".join(month_row).rstrip()
+    if month_str:
+        lines.append(f"       {C_MUTED}{month_str}{RESET}")
+    lines.append("")
+
+    # Sort models by selected metric (fallback to in+out)
+    sorted_models = sorted(
+        models.items(),
+        key=lambda kv: metric_value_for_model(kv[1], metric),
+        reverse=True,
+    )
+
+    if by_model and sorted_models:
+        if effective_w >= 58:
+            grid_name_w = 21
+            two_line_grid = False
+            max_compact = max(4, (effective_w - 2 - grid_name_w) // 2)
+        elif effective_w >= 30:
+            grid_name_w = max(10, min(21, int(effective_w * 0.40)))
+            two_line_grid = False
+            max_compact = max(4, (effective_w - 2 - grid_name_w) // 2)
+        else:
+            grid_name_w = max(8, effective_w - 2)
+            two_line_grid = True
+            max_compact = max(4, (effective_w - 1) // 2)
+        compact_weeks = max(1, min(vis_weeks, max_compact))
+        compact_start = start_of_this_week - timedelta(weeks=compact_weeks - 1)
+        mwd_title = f"  {BOLD}{C_TEXT}Model Weekly Distribution{RESET}"
+        mwd_range = f"{C_MUTED}(Last {compact_weeks}w){RESET}"
+        if visible_len(mwd_title) + 1 + visible_len(mwd_range) <= effective_w:
+            lines.append(f"{mwd_title} {mwd_range}")
+        else:
+            lines.append(truncate_ansi_line(mwd_title, effective_w))
+            lines.append(truncate_ansi_line(f"  {mwd_range}", effective_w))
+        for idx, (m_name, _) in enumerate(sorted_models[:8]):
+            m_color = MODEL_COLORS[idx % len(MODEL_COLORS)]
+            weekly_vals: list[int] = []
+            for w in range(compact_weeks):
+                w_sum = 0
+                for dow in range(7):
+                    d = compact_start + timedelta(days=w * 7 + dow)
+                    rec = daily.get(d.isoformat())
+                    if rec and m_name in rec["models"]:
+                        w_sum += metric_value_for_model(rec["models"][m_name], metric)
+                weekly_vals.append(w_sum)
+            m_cuts = quantile_thresholds(weekly_vals)
+            m_cells: list[tuple[str | None, str]] = []
+            for v in weekly_vals:
+                lvl = heat_level(v, m_cuts)
+                if lvl == 0:
+                    m_cells.append((HEAT_LEVELS[0], "▪"))
+                elif lvl <= 2:
+                    m_cells.append((C_MUTED, "▫"))
+                else:
+                    m_cells.append((m_color, "■"))
+            cells_str = render_colored_cells(m_cells)
+            if two_line_grid:
+                lines.append(f"  {m_color}{truncate_text(m_name, grid_name_w)}{RESET}")
+                lines.append(f"  {cells_str}")
+            else:
+                lines.append(f"  {m_color}{pad_text(m_name, grid_name_w)}{RESET} {cells_str}")
+        lines.append("")
+
+    # Model breakdown bars
+    mb_title = f"  {BOLD}{C_TEXT}Model Breakdown{RESET}"
+    mb_sub = f"{C_MUTED}({tot_steps} steps total){RESET}"
+    if visible_len(mb_title) + 1 + visible_len(mb_sub) <= effective_w:
+        lines.append(f"{mb_title} {mb_sub}")
+    else:
+        lines.append(truncate_ansi_line(mb_title, effective_w))
+        lines.append(truncate_ansi_line(f"  {mb_sub}", effective_w))
+    if not sorted_models:
+        lines.extend(wrap_plain_line("No model usage records found.", effective_w, indent="  ", style=C_MUTED))
+    else:
+        top_models = sorted_models[:10]
+        total_metric = sum(metric_value_for_model(v, metric) for _, v in sorted_models) or 1
+        io_w = max(6, *(len(format_num(v[1] + v[3])) for _, v in top_models))
+        cache_w = max(6, *(len(format_num(v[2])) for _, v in top_models))
+        steps_w = max(4, *(len(str(v[0])) for _, v in top_models))
+        single_fixed = 58 + io_w + cache_w + steps_w
+        single_line_mode = effective_w >= single_fixed + 8
+        if single_line_mode:
+            bar_w = min(26, effective_w - single_fixed)
+        elif effective_w >= 26:
+            mb_name_w = min(21, max(10, int(effective_w * 0.40)))
+            bar_w = min(26, max(6, effective_w - 10 - mb_name_w))
+            if 10 + mb_name_w + bar_w > effective_w:
+                mb_name_w = max(8, effective_w - 10 - bar_w)
+        else:
+            mb_name_w = max(8, effective_w - 2)
+            bar_w = max(4, effective_w - 9)
+
+        for idx, (m_name, vals) in enumerate(top_models):
+            s, i, c, o, t = vals
+            m_val = metric_value_for_model(vals, metric)
+            pct = (m_val / total_metric) * 100.0
+            filled = int(round((pct / 100.0) * bar_w))
+            if pct > 0 and filled == 0:
+                filled = 1
+            m_color = MODEL_COLORS[idx % len(MODEL_COLORS)]
+            bar = render_bar(filled, bar_w, m_color)
+            if single_line_mode:
+                io_str = format_num(i + o).rjust(io_w)
+                cache_str = format_num(c).rjust(cache_w)
+                steps_str = str(s).rjust(steps_w)
+                lines.append(
+                    f"  {m_color}{pad_text(m_name, 21)}{RESET} {bar} {C_TEXT}{pct:5.1f}%{RESET}  "
+                    f"{C_TEXT}{io_str}{RESET} {C_MUTED}in/out{RESET} "
+                    f"{C_MUTED}({cache_str} cache · {steps_str} steps){RESET}"
+                )
+            elif effective_w >= 26:
+                lines.append(
+                    f"  {m_color}{pad_text(m_name, mb_name_w)}{RESET} {bar} {C_TEXT}{pct:5.1f}%{RESET}"
+                )
+                detail_segs = [
+                    f"{C_TEXT}{format_num(i + o)}{RESET} {C_MUTED}in/out{RESET}",
+                    f"{C_MUTED}{format_num(c)} cache{RESET}",
+                    f"{C_MUTED}{s} steps{RESET}",
+                ]
+                lines.extend(wrap_segments(detail_segs, effective_w, indent="    ", sep=f" {C_MUTED}·{RESET} "))
+            else:
+                lines.append(f"  {m_color}{truncate_text(m_name, mb_name_w)}{RESET}")
+                lines.append(f"  {bar} {C_TEXT}{pct:5.1f}%{RESET}")
+                detail_segs = [
+                    f"{C_TEXT}{format_num(i + o)}{RESET} {C_MUTED}in/out{RESET}",
+                    f"{C_MUTED}{format_num(c)} cache{RESET}",
+                    f"{C_MUTED}{s} steps{RESET}",
+                ]
+                lines.extend(wrap_segments(detail_segs, effective_w, indent="  ", sep=f" {C_MUTED}·{RESET} "))
+
+    quota_lines = render_quota_section(quota_snapshot, effective_w=effective_w)
+    if quota_lines:
+        lines.append("")
+        lines.extend(quota_lines)
+
+    if interactive_hint:
+        lines.append("")
+        hint_items = [
+            "[m] metric",
+            "[b] by-model grid",
+            "[e] exact models",
+            "[s] toggle subagents",
+            "[r] refresh",
+            "[q] quit",
+        ]
+        for hint_line in wrap_segments(hint_items, effective_w, indent="  ", sep="  "):
+            body = hint_line[2:] if hint_line.startswith("  ") else hint_line
+            lines.append(f"  {C_MUTED}{body}{RESET}")
+
+    return "\n".join(lines)
+
+
+def run_interactive(args: argparse.Namespace, data_dir: Path) -> int:
+    """Run single-key interactive TUI loop."""
+    metric_idx = METRICS.index(args.metric) if args.metric in METRICS else 0
+    by_model = args.by_model
+    exact_models = args.exact_models
+    exclude_subagents = args.exclude_subagents
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            metric = METRICS[metric_idx]
+            stats = collect_usage(
+                data_dir=data_dir,
+                exclude_subagents=exclude_subagents,
+                project_filter=args.project or "",
+                exact_models=exact_models,
+                days_limit=args.days,
+            )
+            quota = load_quota_snapshot(data_dir)
+            out = render_report(
+                stats=stats,
+                metric=metric,
+                weeks=args.weeks,
+                by_model=by_model,
+                exact_models=exact_models,
+                exclude_subagents=exclude_subagents,
+                quota_snapshot=quota,
+                interactive_hint=True,
+                width=args.width,
+            )
+            sys.stdout.write("\033[2J\033[H" + out + "\n")
+            sys.stdout.flush()
+
+            rlist, _, _ = select.select([sys.stdin], [], [], 60.0)
+            if not rlist:
+                continue
+            ch = sys.stdin.read(1)
+            if ch in ("q", "Q", "\x03", "\x1b"):
+                break
+            if ch in ("m", "M"):
+                metric_idx = (metric_idx + 1) % len(METRICS)
+            elif ch in ("b", "B"):
+                by_model = not by_model
+            elif ch in ("e", "E"):
+                exact_models = not exact_models
+            elif ch in ("s", "S"):
+                exclude_subagents = not exclude_subagents
+            elif ch in ("r", "R"):
+                continue
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct CLI argument parser."""
+    p = argparse.ArgumentParser(
+        prog="agy-stats",
+        description="Render Claude Code-style Antigravity CLI usage heatmap and model breakdown.",
+    )
+    p.add_argument("--data-dir", type=Path, default=None, help="Override Antigravity CLI data directory")
+    p.add_argument("--days", type=int, default=None, help="Only include the last N days")
+    p.add_argument("--weeks", type=int, default=26, help="Max weeks to display in heatmap (default: 26)")
+    p.add_argument("--width", type=positive_int, default=None, help="Override render width in columns (default: auto-detect)")
+    p.add_argument("--metric", choices=METRICS, default="tokens", help="Heatmap & sort metric (default: tokens)")
+    p.add_argument("--by-model", action="store_true", help="Show per-model weekly square distribution rows")
+    p.add_argument("--exact-models", action="store_true", help="Show raw model IDs instead of model families")
+    p.add_argument("--exclude-subagents", action="store_true", help="Exclude child subagent conversations")
+    p.add_argument("--project", type=str, default="", help="Filter conversations by workspace path substring")
+    p.add_argument("--json", action="store_true", help="Output aggregated stats as JSON")
+    p.add_argument("--with-interactive", action="store_true", help="Run interactive TUI mode (requires a TTY)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint."""
+    args = build_parser().parse_args(argv)
+    data_dir = (args.data_dir or default_data_dir()).expanduser()
+
+    if args.json:
+        stats = collect_usage(
+            data_dir=data_dir,
+            exclude_subagents=args.exclude_subagents,
+            project_filter=args.project or "",
+            exact_models=args.exact_models,
+            days_limit=args.days,
+        )
+        # Convert nested defaultdicts / non-JSON types cleanly
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.with_interactive:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print(
+                "agy-stats: --with-interactive requires an interactive TTY (stdin and stdout must be TTYs).",
+                file=sys.stderr,
+            )
+            return 1
+        return run_interactive(args, data_dir)
+
+    stats = collect_usage(
+        data_dir=data_dir,
+        exclude_subagents=args.exclude_subagents,
+        project_filter=args.project or "",
+        exact_models=args.exact_models,
+        days_limit=args.days,
+    )
+    quota = load_quota_snapshot(data_dir)
+    print(
+        render_report(
+            stats=stats,
+            metric=args.metric,
+            weeks=args.weeks,
+            by_model=args.by_model,
+            exact_models=args.exact_models,
+            exclude_subagents=args.exclude_subagents,
+            quota_snapshot=quota,
+            interactive_hint=False,
+            width=args.width,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
