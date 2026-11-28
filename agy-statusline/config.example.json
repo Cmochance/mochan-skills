@@ -1,0 +1,50 @@
+{
+  "theme": "tokyo-night",
+  "no_color": false,
+  "separator": " · ",
+  "left_segments": [
+    "path",
+    "worktree"
+  ],
+  "right_segments": [
+    "permission",
+    "model",
+    "context",
+    "cache",
+    "quota"
+  ],
+  "path": {
+    "home_tilde": true,
+    "abbreviate_parents": true
+  },
+  "worktree": {
+    "icon": "⎇",
+    "show_dirty": true
+  },
+  "cache": {
+    "icon": "⚡",
+    "style": "percent",
+    "hide_when_empty": false
+  },
+  "permission": {
+    "default_fallback": "default"
+  },
+  "thresholds": {
+    "context_warn_pct": 60,
+    "context_critical_pct": 85,
+    "cache_ok_pct": 70,
+    "cache_warn_pct": 30,
+    "quota_ok_pct": 50,
+    "quota_warn_pct": 20,
+    "quota_countdown_below_pct": 20
+  },
+  "quota": {
+    "filter_by_model": true,
+    "write_snapshot": true
+  },
+  "layout": {
+    "right_margin": 2,
+    "min_gap": 2
+  },
+  "colors": {}
+}

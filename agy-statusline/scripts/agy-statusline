@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""Management, preview, installation, and diagnostics CLI for agy-statusline."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+from datetime import datetime
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent
+RENDERER_PATH = SCRIPT_DIR / "statusline.py"
+DEFAULT_SKILL_CMD = "~/.gemini/config/skills/agy-statusline/scripts/statusline.py"
+SHELL_WRAPPERS = frozenset({"env", "python", "python3", "sh", "bash", "zsh"})
+
+
+def _load_renderer():
+    spec = importlib.util.spec_from_file_location("agy_statusline_renderer", RENDERER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load renderer module at {RENDERER_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+renderer = _load_renderer()
+
+
+SCENARIOS: dict[str, dict] = {
+    "default": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "cycle_mode": "auto",
+        "model": {"id": "gemini-4-neon", "display_name": "Gemini 4 Neon (XHigh)", "effort": "xhigh"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "used_percentage": 10.4,
+            "current_usage": {"input_tokens": 12_000, "cache_read_input_tokens": 97_000, "cache_creation_input_tokens": 0},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.94, "reset_in_seconds": 14400},
+            "gemini-weekly": {"remaining_fraction": 0.68, "reset_in_seconds": 432000},
+            "3p-5h": {"remaining_fraction": 1.0, "reset_in_seconds": 0},
+        },
+    },
+    "worktree": {
+        "workspace": {"current_dir": str(Path.home() / "workspace" / "worktrees" / "feat-statusline-skill")},
+        "worktree": {"name": "feat/statusline-skill"},
+        "vcs": {"type": "git", "branch": "feat/statusline-skill", "dirty": True},
+        "cycle_mode": "accept-edits",
+        "model": {"id": "gemini-4-carbon", "display_name": "Gemini 4 Carbon", "effort": "high"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 58_000, "cache_read_input_tokens": 187_000, "cache_creation_input_tokens": 0},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.72, "reset_in_seconds": 10800},
+            "gemini-weekly": {"remaining_fraction": 0.51, "reset_in_seconds": 259200},
+        },
+    },
+    "high-context": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "deep" / "nested" / "service-core")},
+        "vcs": {"type": "git", "branch": "release/v2.4", "dirty": True},
+        "cycle_mode": "plan",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 70_000, "cache_read_input_tokens": 842_000, "cache_creation_input_tokens": 0},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.35, "reset_in_seconds": 7200},
+            "gemini-weekly": {"remaining_fraction": 0.42, "reset_in_seconds": 172800},
+        },
+    },
+    "low-quota": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "sandbox": {"enabled": True},
+        "model": {"display_name": "Gemini 4 Hydrogen (Medium)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 374_000, "cache_read_input_tokens": 306_000, "cache_creation_input_tokens": 0},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.14, "reset_in_seconds": 4800},
+            "gemini-weekly": {"remaining_fraction": 0.19, "reset_in_seconds": 93600},
+            "gemini-disabled": {"remaining_fraction": 0.0, "disabled": True},
+        },
+    },
+    "claude-3p": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "model": {"display_name": "Claude Opus 4.6"},
+        "context_window": {"current_usage": {"input_tokens": 42000, "cache_read_input_tokens": 18000}, "max_tokens": 200_000},
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.99, "reset_in_seconds": 15000},
+            "3p-5h": {"remaining_fraction": 0.45, "reset_in_seconds": 5400},
+            "3p-weekly": {"remaining_fraction": 0.18, "reset_in_seconds": 180000},
+        },
+    },
+    "credits": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "cycle_mode": "auto",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {"used_percentage": 22.5, "context_window_size": 1_048_576},
+        "g1_credits": {"remaining": 2450},
+    },
+    "credits-empty": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "cycle_mode": "auto",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 12_000, "cache_read_input_tokens": 0},
+        },
+        "credits": 0,
+    },
+    "narrow": {
+        "workspace": {"current_dir": str(Path.home() / "alysechen" / "github" / "very-long-workspace-name" / "mochan-skills")},
+        "worktree": {"name": "feature/very-long-worktree-branch-name"},
+        "vcs": {"dirty": True},
+        "cycle_mode": "auto",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 21_600, "cache_read_input_tokens": 158_400},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.88, "reset_in_seconds": 12000},
+            "gemini-weekly": {"remaining_fraction": 0.61, "reset_in_seconds": 300000},
+        },
+        "terminal_width": 64,
+    },
+    "cjk": {
+        "workspace": {"current_dir": str(Path.home() / "项目" / "测试目录" / "中文工程名")},
+        "vcs": {"branch": "功能/状态栏", "dirty": True},
+        "cycle_mode": "plan",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 52_000, "cache_read_input_tokens": 0},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.91, "reset_in_seconds": 10000},
+        },
+        "terminal_width": 84,
+    },
+}
+
+
+def non_negative_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if n < 0:
+        raise argparse.ArgumentTypeError("width must be >= 0")
+    return n
+
+
+def resolve_data_dir(arg: str | None) -> Path:
+    if arg:
+        return Path(arg).expanduser()
+    return renderer.default_data_dir()
+
+
+def collapse_home(path: Path) -> str:
+    home = str(Path.home())
+    s = str(path)
+    if s == home:
+        return "~"
+    if s.startswith(home + os.sep):
+        return "~" + s[len(home):]
+    return s
+
+
+def shell_quote_path(path: Path) -> str:
+    """Format a filesystem path safely for POSIX `sh -c`, preserving `~` expansion."""
+    collapsed = collapse_home(path)
+    if collapsed == "~":
+        return "~"
+    if collapsed.startswith("~/"):
+        rel = collapsed[2:]
+        return "~/" + (shlex.quote(rel) if shlex.quote(rel) != rel else rel)
+    return shlex.quote(collapsed) if shlex.quote(collapsed) != collapsed else collapsed
+
+
+def default_command_value() -> str:
+    preferred = Path(DEFAULT_SKILL_CMD).expanduser()
+    try:
+        if preferred.is_file() and preferred.resolve() == RENDERER_PATH:
+            return DEFAULT_SKILL_CMD
+    except (OSError, RuntimeError):
+        pass
+    return shell_quote_path(RENDERER_PATH)
+
+
+def parse_shell_command(cmd_str: str) -> tuple[str | None, Path | None, bool]:
+    """Parse a `statusLine.command` string as `sh -c` tokens.
+
+    Returns (parse_error, target_file_path, is_direct_executable).
+    """
+    raw = cmd_str.strip()
+    if not raw:
+        return "command is empty", None, False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        return f"invalid shell quoting: {exc}", None, False
+    if not tokens:
+        return "command is empty", None, False
+
+    idx = 0
+    while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith(("=", "/", ".", "~")):
+        name = tokens[idx].split("=", 1)[0]
+        if name.isidentifier():
+            idx += 1
+        else:
+            break
+    if idx >= len(tokens):
+        return "command has only environment assignments", None, False
+
+    first = tokens[idx]
+    base = Path(first).name
+    if base in SHELL_WRAPPERS:
+        idx += 1
+        while idx < len(tokens) and tokens[idx].startswith("-"):
+            idx += 1
+        if idx < len(tokens):
+            return None, Path(tokens[idx]).expanduser(), False
+        return None, Path(first).expanduser(), True
+
+    return None, Path(first).expanduser(), True
+
+
+def _safe_resolve(path: Path) -> Path | None:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    ra, rb = _safe_resolve(a), _safe_resolve(b)
+    if ra is not None and rb is not None:
+        return ra == rb
+    return a == b
+
+
+def _path_exists_no_follow(path: Path) -> bool:
+    try:
+        os.lstat(str(path))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _next_unique_path(base_path: Path, stem_suffix: str) -> Path:
+    """Return base_path if free (including broken symlinks), else timestamped/indexed path."""
+    if not _path_exists_no_follow(base_path):
+        return base_path
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    cand = base_path.with_name(f"{stem_suffix}.{ts}.bak")
+    counter = 1
+    while _path_exists_no_follow(cand):
+        cand = base_path.with_name(f"{stem_suffix}.{ts}.{counter}.bak")
+        counter += 1
+    return cand
+
+
+def read_settings_strict(settings_path: Path) -> tuple[dict, bool]:
+    """Read settings.json strictly. Raises ValueError/JSONDecodeError/OSError on failure."""
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, False
+    if not raw.strip():
+        raise ValueError(f"{settings_path} is empty (expected JSON object)")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{settings_path} top-level JSON must be an object")
+    return parsed, True
+
+
+def _write_atomic_bytes(dest: Path, content: bytes, mode: int) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent),
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fp:
+            fd = -1
+            fp.write(content)
+            fp.flush()
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def atomic_write_json(
+    target: Path,
+    data: dict,
+    backup: bool = True,
+    force_mode: int | None = None,
+) -> Path | None:
+    """Atomically write JSON preserving symlinks, private permissions, and prior backups."""
+    real_target = target.resolve() if target.is_symlink() else target
+    real_target.parent.mkdir(parents=True, exist_ok=True)
+
+    if force_mode is not None:
+        mode = force_mode
+    elif real_target.exists():
+        mode = stat.S_IMODE(real_target.stat().st_mode)
+    else:
+        mode = 0o600
+
+    backup_path: Path | None = None
+    if backup and real_target.is_file():
+        bak_base = target.with_name(target.name + ".bak")
+        backup_path = _next_unique_path(bak_base, target.name)
+        _write_atomic_bytes(backup_path, real_target.read_bytes(), mode)
+
+    payload = (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _write_atomic_bytes(real_target, payload, mode)
+    return backup_path
+
+
+def backup_legacy_file(legacy_path: Path) -> Path:
+    """Rename standalone legacy statusline.py to a non-destructive unique backup file."""
+    base = legacy_path.with_name(legacy_path.name + ".legacy.bak")
+    candidate = _next_unique_path(base, f"{legacy_path.name}.legacy")
+    legacy_path.rename(candidate)
+    return candidate
+
+
+def _atomic_symlink(link_path: Path, target: Path) -> None:
+    """Atomically create or update a symlink at link_path pointing to target."""
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_link = link_path.parent / f".{link_path.name}.{os.getpid()}.{os.urandom(4).hex()}.lnk"
+    try:
+        tmp_link.symlink_to(target)
+        os.replace(tmp_link, link_path)
+    except Exception:
+        try:
+            tmp_link.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def ensure_executable(path: Path) -> bool:
+    """Ensure script has owner/group/other execute bits matching read bits."""
+    if not path.is_file():
+        return False
+    mode = stat.S_IMODE(path.stat().st_mode)
+    desired = mode | stat.S_IXUSR
+    if mode & stat.S_IRGRP:
+        desired |= stat.S_IXGRP
+    if mode & stat.S_IROTH:
+        desired |= stat.S_IXOTH
+    if desired != mode:
+        os.chmod(path, desired)
+        return True
+    return False
+
+
+def _inspect_config_for_cli(data_dir: Path, explicit_path: Path | None = None) -> tuple[Path | None, dict, str | None]:
+    """Strictly inspect config for CLI commands (returns path, merged_cfg, error)."""
+    if explicit_path is not None:
+        try:
+            raw = explicit_path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return explicit_path, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config must be a JSON object: {explicit_path}"
+            return explicit_path, renderer._deep_merge(renderer.DEFAULT_CONFIG, parsed), None
+        except FileNotFoundError:
+            return explicit_path, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config file not found: {explicit_path}"
+        except PermissionError as exc:
+            return explicit_path, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config unreadable (permissions): {exc}"
+        except Exception as exc:
+            return explicit_path, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config malformed JSON ({explicit_path}): {exc}"
+
+    env_cfg = os.environ.get("AGY_STATUSLINE_CONFIG", "").strip()
+    if env_cfg:
+        p = Path(env_cfg).expanduser()
+        return _inspect_config_for_cli(data_dir, explicit_path=p)
+
+    for cand in (SKILL_ROOT / "config.local.json", data_dir / "statusline.json"):
+        try:
+            st = os.lstat(str(cand))
+        except FileNotFoundError:
+            continue
+        except PermissionError as exc:
+            return cand, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config unreadable (permissions): {exc}"
+        except OSError as exc:
+            return cand, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config inaccessible ({cand}): {exc}"
+        if stat.S_ISLNK(st.st_mode) and not cand.exists():
+            return cand, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), f"Config is a dangling symlink: {cand}"
+        return _inspect_config_for_cli(data_dir, explicit_path=cand)
+
+    return None, renderer._deep_merge(renderer.DEFAULT_CONFIG, {}), None
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    if args.config:
+        cfg_path = Path(args.config).expanduser()
+        _, cfg, cfg_err = _inspect_config_for_cli(data_dir, explicit_path=cfg_path)
+        if cfg_err:
+            print(cfg_err, file=sys.stderr)
+            return 1
+    else:
+        _, cfg, cfg_err = _inspect_config_for_cli(data_dir)
+        if cfg_err:
+            print(f"Warning: {cfg_err} (using defaults)", file=sys.stderr)
+
+    payloads: list[tuple[str, dict, bool]] = []  # (label, payload, use_live_settings)
+    if args.from_debug is not None:
+        debug_path = Path(args.from_debug).expanduser() if args.from_debug else renderer.DEFAULT_DEBUG_DUMP_PATH
+        if not debug_path.is_file():
+            print(f"Debug dump not found: {debug_path}", file=sys.stderr)
+            return 1
+        try:
+            parsed = json.loads(debug_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Failed to parse debug dump {debug_path}: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(parsed, dict):
+            print(f"Debug dump is not a JSON object: {debug_path}", file=sys.stderr)
+            return 1
+        payloads.append((f"debug:{debug_path}", parsed, True))
+    elif args.json_input:
+        try:
+            raw = sys.stdin.read() if args.json_input == "-" else Path(args.json_input).expanduser().read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+        except Exception as exc:
+            print(f"Failed to read JSON input: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(parsed, dict):
+            print("JSON input must be an object", file=sys.stderr)
+            return 1
+        payloads.append(("custom-json", parsed, True))
+    else:
+        names = list(SCENARIOS.keys()) if args.scenario == "all" else [args.scenario]
+        for name in names:
+            payloads.append((name, copy.deepcopy(SCENARIOS[name]), False))
+
+    tty_cols = shutil.get_terminal_size((100, 24)).columns
+    default_w = args.width if args.width > 0 else min(tty_cols if tty_cols > 0 else 100, 100)
+    for idx, (label, raw_payload, use_live_settings) in enumerate(payloads):
+        payload = copy.deepcopy(raw_payload)
+        if args.width > 0:
+            payload["terminal_width"] = args.width
+        else:
+            raw_tw = payload.get("terminal_width")
+            if not (renderer.is_num(raw_tw) and int(float(raw_tw)) > 0):
+                payload["terminal_width"] = default_w
+        width = int(float(payload["terminal_width"]))
+        line = renderer.render(
+            payload,
+            config=cfg,
+            settings=None if use_live_settings else {},
+            data_dir=data_dir,
+            no_color=bool(args.no_color),
+        )
+        vis_w = renderer.display_width(line)
+        overflow = " OVERFLOW!" if vis_w > width else ""
+        if idx > 0:
+            print()
+        print(f"[{label} | cols={vis_w}/{width}{overflow}]")
+        print(line)
+    return 0
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    settings_path = data_dir / "settings.json"
+    legacy_path = data_dir / "statusline.py"
+
+    if not RENDERER_PATH.is_file():
+        print(f"Renderer not found: {RENDERER_PATH}", file=sys.stderr)
+        return 1
+
+    try:
+        settings, existed = read_settings_strict(settings_path)
+    except PermissionError as exc:
+        print(f"Permission denied reading {settings_path}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Unable to read {settings_path}: {exc}", file=sys.stderr)
+        return 1
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Refusing to modify malformed {settings_path}: {exc}", file=sys.stderr)
+        return 1
+
+    if args.link_legacy:
+        command_val = args.command or shell_quote_path(legacy_path)
+    else:
+        command_val = args.command or default_command_value()
+
+    parse_err, cmd_target, _ = parse_shell_command(command_val)
+    if parse_err:
+        print(f"Invalid --command {command_val!r}: {parse_err}", file=sys.stderr)
+        return 1
+
+    new_settings = dict(settings)
+    existing_sl = settings.get("statusLine")
+    sl = dict(existing_sl) if isinstance(existing_sl, dict) else {}
+    sl.update({"type": "command", "command": command_val, "enabled": True})
+    new_settings["statusLine"] = sl
+
+    should_backup_legacy = (
+        not args.link_legacy
+        and not args.no_backup_legacy
+        and legacy_path.is_file()
+        and not legacy_path.is_symlink()
+        and (cmd_target is None or not _same_path(cmd_target, legacy_path))
+    )
+
+    actions: list[str] = []
+    if args.link_legacy:
+        if legacy_path.is_symlink():
+            if _safe_resolve(legacy_path) != RENDERER_PATH:
+                actions.append(f"Update symlink {legacy_path} -> {RENDERER_PATH}")
+        elif legacy_path.exists():
+            actions.append(f"Backup legacy {legacy_path} -> {legacy_path.name}.legacy.bak and symlink -> {RENDERER_PATH}")
+        else:
+            actions.append(f"Create symlink {legacy_path} -> {RENDERER_PATH}")
+
+    actions.append(
+        f"{'Update' if existed else 'Create'} {settings_path} statusLine.command = {command_val}"
+    )
+    if should_backup_legacy:
+        actions.append(f"Backup standalone legacy {legacy_path} -> {legacy_path.name}.legacy.bak")
+
+    if args.dry_run:
+        print("Dry run — planned actions:")
+        for act in actions:
+            print(f"  - {act}")
+        return 0
+
+    ensure_executable(RENDERER_PATH)
+
+    legacy_bak: Path | None = None
+    prev_link_target: Path | None = None
+    if args.link_legacy:
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        if legacy_path.is_symlink():
+            try:
+                prev_link_target = Path(os.readlink(legacy_path))
+            except OSError:
+                prev_link_target = None
+        elif legacy_path.exists():
+            legacy_bak = backup_legacy_file(legacy_path)
+            print(f"Backed up legacy script: {legacy_bak}")
+        _atomic_symlink(legacy_path, RENDERER_PATH)
+        print(f"Linked {legacy_path} -> {RENDERER_PATH}")
+
+    try:
+        bak_settings = atomic_write_json(settings_path, new_settings, backup=True, force_mode=0o600)
+    except Exception:
+        if args.link_legacy:
+            try:
+                if prev_link_target is not None:
+                    _atomic_symlink(legacy_path, prev_link_target)
+                elif legacy_bak is not None and legacy_bak.exists():
+                    legacy_path.unlink(missing_ok=True)
+                    legacy_bak.rename(legacy_path)
+                else:
+                    legacy_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+    if should_backup_legacy:
+        bak = backup_legacy_file(legacy_path)
+        print(f"Backed up legacy standalone script: {bak}")
+
+    if bak_settings:
+        print(f"Backed up settings: {bak_settings}")
+    print(f"Installed statusLine in {settings_path}:")
+    print(json.dumps(new_settings["statusLine"], indent=2))
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    settings_path = data_dir / "settings.json"
+    try:
+        settings, existed = read_settings_strict(settings_path)
+    except PermissionError as exc:
+        print(f"Permission denied reading {settings_path}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Unable to read {settings_path}: {exc}", file=sys.stderr)
+        return 1
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Refusing to modify malformed {settings_path}: {exc}", file=sys.stderr)
+        return 1
+
+    if not existed or "statusLine" not in settings:
+        print(f"No statusLine configuration found in {settings_path}.")
+        return 0
+
+    new_settings = dict(settings)
+    if args.remove:
+        new_settings.pop("statusLine", None)
+        desc = "remove statusLine block"
+    else:
+        sl = dict(settings.get("statusLine")) if isinstance(settings.get("statusLine"), dict) else {}
+        sl["enabled"] = False
+        new_settings["statusLine"] = sl
+        desc = "set statusLine.enabled = false"
+
+    if args.dry_run:
+        print(f"Dry run — would {desc} in {settings_path}")
+        return 0
+
+    bak_settings = atomic_write_json(settings_path, new_settings, backup=True, force_mode=0o600)
+    if bak_settings:
+        print(f"Backed up settings: {bak_settings}")
+    print(f"Updated {settings_path} ({desc}).")
+    return 0
+
+
+def _quota_snapshot_info(data_dir: Path) -> dict:
+    snap_path = data_dir / "cache" / "quota_snapshot.json"
+    info: dict = {"path": str(snap_path), "exists": False}
+    try:
+        raw = snap_path.read_text(encoding="utf-8")
+        info["exists"] = True
+    except FileNotFoundError:
+        return info
+    except PermissionError as exc:
+        info["exists"] = None
+        info["error"] = f"permission denied: {exc}"
+        return info
+    except OSError as exc:
+        info["error"] = str(exc)
+        return info
+
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            info["error"] = "snapshot JSON must be an object"
+            return info
+        updated = parsed.get("updated_at")
+        quota = parsed.get("quota")
+        info["updated_at"] = updated
+        info["bucket_count"] = len(renderer.parse_quota_buckets(quota))
+        if isinstance(updated, str) and updated:
+            dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            age_sec = max(0, int((datetime.now().astimezone() - dt.astimezone()).total_seconds()))
+            info["age_seconds"] = age_sec
+        else:
+            info["error"] = "missing updated_at timestamp"
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def _legacy_file_state(legacy_path: Path) -> str:
+    try:
+        st = os.lstat(str(legacy_path))
+    except FileNotFoundError:
+        return "absent"
+    except PermissionError:
+        return "unreadable (permission denied)"
+    except OSError as exc:
+        return f"error ({exc})"
+
+    if stat.S_ISLNK(st.st_mode):
+        resolved = _safe_resolve(legacy_path)
+        if resolved is None or not legacy_path.exists():
+            try:
+                raw_target = os.readlink(legacy_path)
+            except OSError:
+                raw_target = "?"
+            return f"broken_symlink -> {raw_target}"
+        return f"symlink -> {resolved}"
+    if stat.S_ISREG(st.st_mode):
+        return "standalone_file"
+    return "non_regular"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    settings_path = data_dir / "settings.json"
+    legacy_path = data_dir / "statusline.py"
+    cfg_path, cfg, cfg_err = _inspect_config_for_cli(data_dir)
+
+    settings_err = None
+    settings: dict = {}
+    settings_exists: bool | None
+    try:
+        settings, settings_exists = read_settings_strict(settings_path)
+    except PermissionError as exc:
+        settings_exists = None
+        settings_err = f"permission denied: {exc}"
+    except Exception as exc:
+        settings_exists = _path_exists_no_follow(settings_path)
+        settings_err = str(exc)
+
+    sl = settings.get("statusLine") if isinstance(settings.get("statusLine"), dict) else None
+    cmd_str = sl.get("command") if isinstance(sl, dict) else None
+    cmd_parse_err = None
+    cmd_path: Path | None = None
+    is_direct_exec = True
+    if isinstance(cmd_str, str) and cmd_str.strip():
+        cmd_parse_err, cmd_path, is_direct_exec = parse_shell_command(cmd_str)
+
+    cmd_is_file = bool(cmd_path and cmd_path.is_file())
+    cmd_resolved = _safe_resolve(cmd_path) if cmd_is_file and cmd_path is not None else None
+    cmd_exec = bool(cmd_is_file and cmd_path is not None and (not is_direct_exec or os.access(cmd_path, os.X_OK)))
+    legacy_state = _legacy_file_state(legacy_path)
+
+    report = {
+        "skill_root": str(SKILL_ROOT),
+        "renderer_path": str(RENDERER_PATH),
+        "data_dir": str(data_dir),
+        "settings_path": str(settings_path),
+        "settings_exists": settings_exists,
+        "settings_error": settings_err,
+        "statusLine": sl,
+        "command_parse_error": cmd_parse_err,
+        "command_exists": cmd_is_file,
+        "command_executable": cmd_exec,
+        "command_resolved": str(cmd_resolved) if cmd_resolved else None,
+        "points_to_skill_renderer": bool(cmd_resolved and cmd_resolved == RENDERER_PATH),
+        "config_source": str(cfg_path) if cfg_path else "built-in defaults",
+        "config_error": cfg_err,
+        "theme": cfg.get("theme"),
+        "left_segments": cfg.get("left_segments"),
+        "right_segments": cfg.get("right_segments"),
+        "legacy_file": legacy_state,
+        "quota_snapshot": _quota_snapshot_info(data_dir),
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    print(f"Skill root       : {report['skill_root']}")
+    print(f"Renderer         : {report['renderer_path']}")
+    print(f"Settings         : {report['settings_path']}")
+    if settings_err:
+        print(f"  ERROR          : {settings_err}")
+    elif sl:
+        print(f"  enabled        : {sl.get('enabled')}")
+        print(f"  type           : {sl.get('type')}")
+        print(f"  command        : {cmd_str}")
+        if cmd_parse_err:
+            print(f"  command error  : {cmd_parse_err}")
+        print(f"  matches skill  : {report['points_to_skill_renderer']}")
+    else:
+        print("  statusLine     : (not configured)")
+    print(f"Config source    : {report['config_source']}")
+    if cfg_err:
+        print(f"  config ERROR   : {cfg_err}")
+    print(f"Theme / Segments : {report['theme']} | L={report['left_segments']} R={report['right_segments']}")
+    print(f"Legacy file      : {legacy_state}")
+    q = report["quota_snapshot"]
+    if q.get("error"):
+        print(f"Quota snapshot   : ERROR ({q['error']})")
+    elif q.get("exists"):
+        age_m = q.get("age_seconds", 0) // 60
+        print(f"Quota snapshot   : {q['path']} ({q.get('bucket_count', 0)} buckets, {age_m}m ago)")
+    else:
+        print(f"Quota snapshot   : absent ({q['path']})")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    settings_path = data_dir / "settings.json"
+    legacy_path = data_dir / "statusline.py"
+    failures = 0
+
+    def emit(level: str, msg: str) -> None:
+        nonlocal failures
+        if level == "FAIL":
+            failures += 1
+        print(f"[{level}] {msg}")
+
+    # 1. Settings JSON
+    settings: dict = {}
+    settings_loaded = False
+    try:
+        settings, existed = read_settings_strict(settings_path)
+        if not existed:
+            emit("FAIL", f"settings.json not found: {settings_path} (run: agy-statusline install)")
+        else:
+            settings_loaded = True
+            emit("OK", f"settings.json valid JSON: {settings_path}")
+    except PermissionError as exc:
+        emit("FAIL", f"settings.json unreadable (sandbox/permissions): {exc}")
+    except Exception as exc:
+        emit("FAIL", f"settings.json malformed: {exc}")
+
+    # 2. statusLine block & command resolution
+    cmd_str: str | None = None
+    cmd_path: Path | None = None
+    cmd_runnable = False
+    if settings_loaded:
+        sl = settings.get("statusLine") if isinstance(settings.get("statusLine"), dict) else None
+        if not sl:
+            emit("FAIL", "settings.json missing statusLine block (run: agy-statusline install)")
+        else:
+            if sl.get("enabled") is True and sl.get("type") == "command":
+                emit("OK", f"statusLine enabled (type=command, command={sl.get('command')})")
+            else:
+                emit("WARN", f"statusLine not active (enabled={sl.get('enabled')}, type={sl.get('type')})")
+            raw_cmd = sl.get("command")
+            if isinstance(raw_cmd, str) and raw_cmd.strip():
+                cmd_str = raw_cmd.strip()
+                parse_err, cmd_path, is_direct = parse_shell_command(cmd_str)
+                if parse_err or cmd_path is None:
+                    emit("FAIL", f"statusLine.command invalid: {parse_err}")
+                elif not cmd_path.is_file():
+                    emit("FAIL", f"statusLine command target is not a file: {cmd_path}")
+                elif is_direct and not os.access(cmd_path, os.X_OK):
+                    emit("FAIL", f"statusLine command is not executable: {cmd_path}")
+                else:
+                    cmd_runnable = True
+                    resolved = _safe_resolve(cmd_path)
+                    if resolved == RENDERER_PATH:
+                        emit("OK", f"statusLine command resolves to skill renderer: {resolved}")
+                    else:
+                        emit("WARN", f"statusLine command resolves to {resolved}, not skill renderer {RENDERER_PATH}")
+            else:
+                emit("FAIL", "statusLine.command is empty")
+
+    # 3. Legacy file divergence / broken symlink check
+    legacy_state = _legacy_file_state(legacy_path)
+    if legacy_state.startswith("broken_symlink"):
+        emit("WARN", f"Broken legacy symlink at {legacy_path}: {legacy_state}")
+    elif legacy_state == "standalone_file":
+        if not (cmd_path and cmd_path.is_file() and _same_path(cmd_path, legacy_path)):
+            emit("WARN", f"Unused standalone legacy file still exists: {legacy_path}")
+
+    # 4. Config file validation
+    cfg_path, _, cfg_err = _inspect_config_for_cli(data_dir)
+    if cfg_err:
+        emit("FAIL", cfg_err)
+    elif cfg_path is None:
+        emit("OK", "Config: using built-in defaults (no local config)")
+    else:
+        parsed_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        raw_theme = parsed_cfg.get("theme", "tokyo-night")
+        if not isinstance(raw_theme, str):
+            emit("WARN", f"Config {cfg_path}: theme must be a string (got {type(raw_theme).__name__}), will fall back to tokyo-night")
+        else:
+            norm_theme = raw_theme.strip().lower()
+            if norm_theme not in renderer.THEMES:
+                emit("WARN", f"Config {cfg_path}: unknown theme {raw_theme!r}, will fall back to tokyo-night")
+            else:
+                emit("OK", f"Config valid JSON: {cfg_path} (theme={norm_theme})")
+
+    # 5. Live subprocess smoke & latency check (mirrors agy `sh -c` invocation)
+    using_fallback = not (cmd_runnable and cmd_str)
+    if using_fallback:
+        run_argv = [str(RENDERER_PATH)]
+        smoke_label = "Renderer smoke (fallback skill renderer)"
+    else:
+        run_argv = ["/bin/sh", "-c", cmd_str]
+        smoke_label = "Renderer smoke"
+
+    sample = copy.deepcopy(SCENARIOS["default"])
+    sample["terminal_width"] = 100
+    env = dict(os.environ)
+    env["AGY_DATA_DIR"] = str(data_dir)
+    env["AGY_STATUSLINE_NO_SNAPSHOT"] = "1"
+    env.pop("AGY_STATUSLINE_DEBUG", None)
+    payload_str = json.dumps(sample)
+    try:
+        t0 = time.perf_counter()
+        proc = subprocess.run(
+            run_argv,
+            input=payload_str,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            env=env,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        lines = proc.stdout.splitlines()
+        if proc.returncode != 0:
+            emit("FAIL", f"{smoke_label} exited {proc.returncode}: {proc.stderr.strip()}")
+        elif len(lines) != 1 or not lines[0].strip():
+            emit("FAIL", f"{smoke_label} expected 1 non-empty line, got {len(lines)}")
+        else:
+            vis_w = renderer.display_width(lines[0])
+            if vis_w > 100:
+                emit("FAIL", f"{smoke_label} width {vis_w} exceeds terminal_width 100")
+            else:
+                if elapsed_ms >= 100.0:
+                    t1 = time.perf_counter()
+                    proc2 = subprocess.run(
+                        run_argv,
+                        input=payload_str,
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                        env=env,
+                    )
+                    elapsed_ms = (time.perf_counter() - t1) * 1000.0
+                    lines2 = proc2.stdout.splitlines()
+                    if proc2.returncode != 0 or len(lines2) != 1 or not lines2[0].strip():
+                        emit("FAIL", f"{smoke_label} retry failed (rc={proc2.returncode}): {proc2.stderr.strip()}")
+                        lines2 = []
+                    elif renderer.display_width(lines2[0]) > 100:
+                        emit("FAIL", f"{smoke_label} retry width {renderer.display_width(lines2[0])} exceeds 100")
+                        lines2 = []
+                    else:
+                        vis_w = renderer.display_width(lines2[0])
+                    if not lines2:
+                        vis_w = -1
+                if vis_w >= 0:
+                    emit("OK", f"{smoke_label} passed in {elapsed_ms:.1f}ms (width={vis_w}/100)")
+                    if elapsed_ms >= 100.0:
+                        emit("WARN", f"{smoke_label} steady-state latency high: {elapsed_ms:.1f}ms (target < 100ms)")
+    except Exception as exc:
+        emit("FAIL", f"{smoke_label} execution failed: {exc}")
+
+    # 6. Quota snapshot contract (agy-stats integration)
+    q = _quota_snapshot_info(data_dir)
+    if q.get("error"):
+        emit("WARN", f"quota_snapshot.json unreadable/invalid: {q['error']}")
+    elif q.get("exists"):
+        if q.get("bucket_count", 0) <= 0:
+            emit("WARN", f"quota_snapshot.json has 0 usable buckets ({q['path']})")
+        else:
+            age_m = q.get("age_seconds", 0) // 60
+            emit("OK", f"quota_snapshot.json ready for agy-stats ({q['bucket_count']} buckets, {age_m}m ago)")
+    else:
+        emit("WARN", f"quota_snapshot.json not created yet ({q['path']})")
+
+    return 1 if failures else 0
+
+
+def cmd_init_config(args: argparse.Namespace) -> int:
+    example = SKILL_ROOT / "config.example.json"
+    local = SKILL_ROOT / "config.local.json"
+    if not example.is_file():
+        print(f"Template not found: {example}", file=sys.stderr)
+        return 1
+    if _path_exists_no_follow(local) and not args.force:
+        print(f"Config already exists: {local} (pass --force to overwrite)")
+        return 0
+    if local.is_symlink():
+        local.unlink()
+    shutil.copy2(example, local)
+    print(f"Created local config: {local}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agy-statusline",
+        description="Manage, preview, and diagnose the custom Antigravity CLI statusline.",
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    p_prev = sub.add_parser("preview", help="Render mock or debug payloads for visual inspection")
+    p_prev.add_argument(
+        "--scenario",
+        choices=["all", *SCENARIOS.keys()],
+        default="all",
+        help="Built-in mock scenario to render (default: all)",
+    )
+    p_prev.add_argument("--width", type=non_negative_int, default=0, help="Override terminal width in columns (>= 0)")
+    p_prev.add_argument(
+        "--from-debug",
+        nargs="?",
+        const="",
+        default=None,
+        help="Render from AGY_STATUSLINE_DEBUG dump (default: /tmp/agy-statusline-debug.json)",
+    )
+    p_prev.add_argument("--json-input", default="", help="Read payload JSON from file path or '-' for stdin")
+    p_prev.add_argument("--config", default="", help="Test with an alternate config JSON file")
+    p_prev.add_argument("--no-color", action="store_true", help="Disable ANSI colors in preview")
+    p_prev.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_prev.set_defaults(func=cmd_preview)
+
+    p_inst = sub.add_parser("install", help="Configure settings.json to use this skill's statusline")
+    p_inst.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_inst.add_argument("--command", default="", help="Explicit statusLine.command string to write")
+    p_inst.add_argument(
+        "--link-legacy",
+        action="store_true",
+        help="Symlink <data-dir>/statusline.py to skill renderer and use that path",
+    )
+    p_inst.add_argument(
+        "--no-backup-legacy",
+        action="store_true",
+        help="Do not rename standalone legacy <data-dir>/statusline.py",
+    )
+    p_inst.add_argument("--dry-run", action="store_true", help="Show planned changes without writing")
+    p_inst.set_defaults(func=cmd_install)
+
+    p_uninst = sub.add_parser("uninstall", help="Disable or remove statusLine in settings.json")
+    p_uninst.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_uninst.add_argument("--remove", action="store_true", help="Remove statusLine key instead of disabling")
+    p_uninst.add_argument("--dry-run", action="store_true", help="Show planned changes without writing")
+    p_uninst.set_defaults(func=cmd_uninstall)
+
+    p_stat = sub.add_parser("status", help="Show current installation, config source, and snapshot state")
+    p_stat.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_stat.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_stat.set_defaults(func=cmd_status)
+
+    p_doc = sub.add_parser("doctor", help="Run health, latency, and integration diagnostics")
+    p_doc.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    p_init = sub.add_parser("init-config", help="Create config.local.json from config.example.json")
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing config.local.json")
+    p_init.set_defaults(func=cmd_init_config)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
