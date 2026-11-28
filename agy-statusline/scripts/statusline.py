@@ -2,11 +2,13 @@
 """Custom statusline renderer for Antigravity CLI (agy).
 
 Pure-stdlib hot-path renderer invoked directly by `agy` via settings.json.
-Zero subprocesses, zero network calls, single-line ANSI output.
+Zero subprocesses, zero network calls, single-line (or optional pixel-pet
+multi-line) ANSI output.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -118,6 +120,16 @@ DEFAULT_CONFIG: dict = {
     "layout": {
         "right_margin": 2,
         "min_gap": 2,
+    },
+    "pet": {
+        "enabled": True,
+        "species": "gemini",
+        "style": "pixel",
+        "position": "above",
+        "align": "right",
+        "name": "",
+        "show_bubble": True,
+        "animate": True,
     },
     "colors": {},
 }
@@ -1581,37 +1593,54 @@ def resolve_terminal_width(data: dict) -> int:
     return term_width if term_width > 0 else 100
 
 
-def render(
-    data: dict,
-    *,
-    config: dict | None = None,
-    settings: dict | None = None,
-    data_dir: Path | None = None,
-    no_color: bool = False,
+_PET_MODULE = None
+_PET_LOAD_TRIED = False
+
+
+def is_pet_enabled(cfg: dict) -> bool:
+    """Resolve pet toggle: AGY_STATUSLINE_PET env overrides config.pet.enabled."""
+    env_flag = os.environ.get("AGY_STATUSLINE_PET", "").strip().lower()
+    if env_flag in ("0", "false", "no", "off"):
+        return False
+    if env_flag in ("1", "true", "yes", "on"):
+        return True
+    pet_cfg = cfg.get("pet")
+    if isinstance(pet_cfg, dict) and isinstance(pet_cfg.get("enabled"), bool):
+        return pet_cfg["enabled"]
+    return True
+
+
+def _load_pet_module():
+    """Lazy-load sibling pet.py module only when pet rendering is active."""
+    global _PET_MODULE, _PET_LOAD_TRIED
+    if _PET_LOAD_TRIED:
+        return _PET_MODULE
+    _PET_LOAD_TRIED = True
+    pet_path = Path(__file__).resolve().parent / "pet.py"
+    if not pet_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("agy_statusline_pet", pet_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PET_MODULE = mod
+    except Exception:
+        _PET_MODULE = None
+    return _PET_MODULE
+
+
+def _compose_status_bar(
+    left: str,
+    right: str,
+    pal: dict[str, str],
+    term_width: int,
+    target_width: int,
+    min_gap: int,
 ) -> str:
-    """Render the full single-line status bar."""
-    cfg = config if config is not None else load_config(data_dir=data_dir)
-    active_settings = settings if settings is not None else load_settings(data_dir=data_dir)
-    pal = build_palette(cfg, no_color=no_color)
-
-    right = _build_right(data, active_settings, cfg, pal)
-    term_width = resolve_terminal_width(data)
-
-    layout_cfg = cfg.get("layout") if isinstance(cfg.get("layout"), dict) else {}
-    right_margin = max(0, int(_num_cfg(layout_cfg, "right_margin", 2)))
-    min_gap = max(1, int(_num_cfg(layout_cfg, "min_gap", 2)))
-    target_width = min(term_width, max(term_width - right_margin, 20)) if term_width >= 20 else max(1, term_width)
-
+    """Compose the single status bar line guaranteeing display_width <= term_width."""
     right_w = display_width(right)
-    if right:
-        # Reserve at least 1 col for left when term_width allows both sides; otherwise let left adapt cleanly
-        avail_left = target_width - min_gap - right_w
-        if avail_left <= 0 and term_width >= 3:
-            avail_left = 1
-    else:
-        avail_left = target_width
-    left = _build_left(data, cfg, pal, avail_left, data_dir=data_dir)
-
     if not left and not right:
         return ""
     if not right:
@@ -1629,7 +1658,6 @@ def render(
 
     left_w = display_width(left)
     if left_w + 2 > term_width:
-        # Terminal too narrow to display both left + gap + right without overflowing
         plain_left = truncate_left_ellipsis(ANSI_RE.sub("", left), term_width)
         return f"{pal['path']}{plain_left}{pal['reset']}"
 
@@ -1644,6 +1672,86 @@ def render(
     if left_w + gap_len + right_w > term_width:
         gap_len = max(1, term_width - left_w - right_w)
     return f"{left}{' ' * gap_len}{right}{pal['reset']}"
+
+
+def render(
+    data: dict,
+    *,
+    config: dict | None = None,
+    settings: dict | None = None,
+    data_dir: Path | None = None,
+    no_color: bool = False,
+    no_pet: bool = False,
+) -> str:
+    """Render the status bar (plus optional animated pixel/ASCII/inline pet)."""
+    cfg = config if config is not None else load_config(data_dir=data_dir)
+    active_settings = settings if settings is not None else load_settings(data_dir=data_dir)
+    pal = build_palette(cfg, no_color=no_color)
+
+    right = _build_right(data, active_settings, cfg, pal)
+    term_width = resolve_terminal_width(data)
+
+    layout_cfg = cfg.get("layout") if isinstance(cfg.get("layout"), dict) else {}
+    right_margin = max(0, int(_num_cfg(layout_cfg, "right_margin", 2)))
+    min_gap = max(1, int(_num_cfg(layout_cfg, "min_gap", 2)))
+    target_width = min(term_width, max(term_width - right_margin, 20)) if term_width >= 20 else max(1, term_width)
+
+    pet_on = False if no_pet else is_pet_enabled(cfg)
+    pet_cfg = cfg.get("pet") if isinstance(cfg.get("pet"), dict) else {}
+    pet_style = str(pet_cfg.get("style") or "pixel").strip().lower()
+    pet_pos = str(pet_cfg.get("position") or "above").strip().lower()
+    pet_align = str(pet_cfg.get("align") or "right").strip().lower()
+    pet_mod = _load_pet_module() if pet_on else None
+
+    inline_pet = ""
+    if pet_mod is not None and pet_style == "inline" and term_width >= 16:
+        cand_pet = pet_mod.render_inline_pet(data, cfg, pal)
+        cand_w = display_width(cand_pet)
+        if pet_align == "right":
+            if right:
+                if display_width(right) + 2 + cand_w <= target_width:
+                    right = f"{right}  {cand_pet}"
+            elif cand_w <= target_width:
+                right = cand_pet
+        else:
+            inline_pet = cand_pet
+
+    right_w = display_width(right)
+    if right:
+        raw_avail_left = target_width - min_gap - right_w
+        if raw_avail_left <= 0 and term_width >= 3:
+            raw_avail_left = 1
+    else:
+        raw_avail_left = target_width
+
+    avail_left = raw_avail_left
+    attach_left_pet = ""
+    if inline_pet:
+        cand_w = display_width(inline_pet)
+        raw_left_segs = cfg.get("left_segments")
+        has_left_segs = bool(raw_left_segs) if isinstance(raw_left_segs, list) else True
+        if has_left_segs and raw_avail_left >= cand_w + 3:
+            attach_left_pet = inline_pet
+            avail_left = raw_avail_left - cand_w - 1
+        elif not has_left_segs and cand_w <= raw_avail_left:
+            attach_left_pet = inline_pet
+
+    left = _build_left(data, cfg, pal, avail_left, data_dir=data_dir)
+    if attach_left_pet:
+        left = f"{attach_left_pet} {left}" if left else attach_left_pet
+
+    bar_line = _compose_status_bar(left, right, pal, term_width, target_width, min_gap)
+
+    if pet_mod is not None and pet_style != "inline":
+        pet_lines = pet_mod.render_pet_lines(data, cfg, pal, term_width, target_width=target_width)
+        if pet_lines:
+            if not bar_line:
+                return "\n".join(pet_lines)
+            if pet_pos == "below":
+                return "\n".join([bar_line, *pet_lines])
+            return "\n".join([*pet_lines, bar_line])
+
+    return bar_line
 
 
 def _atomic_write_private(dest: Path, content: str) -> None:

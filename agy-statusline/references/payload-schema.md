@@ -4,7 +4,7 @@ This reference documents the stdin JSON contract consumed by `scripts/statusline
 
 ## 1. Stdin JSON Payload Fields
 
-`agy` invokes `statusLine.command` with a JSON object on `stdin` and displays the first line printed to `stdout`. All fields are optional and defensive fallbacks are applied.
+`agy` invokes `statusLine.command` with a JSON object on `stdin` and displays its `stdout` (single-line or multi-line ANSI) below the TUI prompt panel, throttled to at most once every 300ms on state changes. All fields are optional and defensive fallbacks are applied.
 
 ### Workspace & Path
 Checked in priority order:
@@ -73,6 +73,14 @@ Reads `context_window.current_usage` (latest model step):
 4. Countdown `(<dur>)` appends when remaining percentage `<= thresholds.quota_countdown_below_pct` (default `20`), or when `remaining_amount <= 0`.
 5. Fallback when `quota` has no usable buckets: `credits`, `ai_credits`, `g1_credits` (scalar or dict with `remaining`/`available`/`balance`/`amount`/`value`) → `AI: <N>` or `AI: Out of credits`.
 
+### Agent State, Tool Confirmation & Subagents (`pet` companion)
+Consumed by `scripts/pet.py` (lazy-imported only when `pet.enabled` is active and not disabled via `AGY_STATUSLINE_PET=0`):
+- `agent_state`: `"idle"` | `"working"` | `"tool_use"` | `"reviewing"` | `"authenticating"` | `"initializing"` | `"error"`
+- `tool_confirmation_pending`: `bool` (triggers `"confirm"` waiting pose/alert)
+- `subagents`: list of dicts with `status: "running"` (displays `+<N> sub` badge in the pet bubble)
+- Also reacts to `context_window` (`>= thresholds.context_critical_pct` → `"tired"`) and `quota` (`<= thresholds.quota_warn_pct` → `"hungry"`).
+- Rendering styles: `pixel` (5-row 10×16 half-block `▀`/`▄` TrueColor Gemini pixel cat in `gemini` lavender-purple or `prism` rainbow aurora palette, degrades cleanly to monochrome ASCII under `NO_COLOR`/`plain`), `ascii` (5-row monospace sprite), or `inline` (1-line companion). Supports `align: "right"` (default, flush with right edge of status bar) or `"left"`, and `position: "above"` (default) or `"below"`. Multi-line pet automatically hides when `terminal_width < 20` so narrow terminals never overflow.
+
 ### Terminal Width
 - Resolution order: `terminal_width` (positive finite int) → `COLUMNS` env var (positive int) → `os.get_terminal_size().columns` (when `> 0`) → `100`.
 
@@ -103,5 +111,7 @@ Config lookup order: `AGY_STATUSLINE_CONFIG` → `<skill_root>/config.local.json
 | `AGY_STATUSLINE_CONFIG` | Explicit path to a statusline config JSON file (highest precedence). |
 | `AGY_STATUSLINE_DEBUG` | Set to `1`/`true`/`yes` to atomically dump raw stdin JSON to `/tmp/agy-statusline-debug.json` (mode `0600`), `0`/`false`/`no` to disable, or another non-empty value for a custom file path. |
 | `AGY_STATUSLINE_NO_SNAPSHOT` | Set to `1`/`true`/`yes` to skip writing `cache/quota_snapshot.json` (used by `agy-statusline doctor` and benchmarks). |
+| `AGY_STATUSLINE_PET` | Override `config.pet.enabled` for a session (`0`/`false`/`no`/`off` disables pet with zero import overhead; `1`/`true`/`yes`/`on` enables). |
+| `AGY_STATUSLINE_PET_FRAME` | Optional non-negative integer pinning the animation frame index (useful for deterministic tests and screenshots). |
 | `COLUMNS` | Fallback terminal column width when `terminal_width` is absent from stdin JSON. |
 | `NO_COLOR` | Any non-empty value disables ANSI escape sequences. |

@@ -49,5 +49,15 @@
     "right_margin": 2,
     "min_gap": 2
   },
+  "pet": {
+    "enabled": true,
+    "species": "gemini",
+    "style": "pixel",
+    "position": "above",
+    "align": "right",
+    "name": "",
+    "show_bubble": true,
+    "animate": true
+  },
   "colors": {}
 }

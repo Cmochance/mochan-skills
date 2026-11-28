@@ -21,6 +21,7 @@ import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPT_DIR.parent
 RENDERER_PATH = SCRIPT_DIR / "statusline.py"
+PET_PATH = SCRIPT_DIR / "pet.py"
 DEFAULT_SKILL_CMD = "~/.gemini/config/skills/agy-statusline/scripts/statusline.py"
 SHELL_WRAPPERS = frozenset({"env", "python", "python3", "sh", "bash", "zsh"})
 
@@ -29,6 +30,15 @@ def _load_renderer():
     spec = importlib.util.spec_from_file_location("agy_statusline_renderer", RENDERER_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load renderer module at {RENDERER_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_pet():
+    spec = importlib.util.spec_from_file_location("agy_statusline_pet_cli", PET_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load pet module at {PET_PATH}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -157,6 +167,59 @@ SCENARIOS: dict[str, dict] = {
             "gemini-5h": {"remaining_fraction": 0.91, "reset_in_seconds": 10000},
         },
         "terminal_width": 84,
+    },
+    "working": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "feat/pixel-pet", "dirty": True},
+        "cycle_mode": "auto",
+        "agent_state": "working",
+        "model": {"id": "gemini-4-neon", "display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 18_000, "cache_read_input_tokens": 120_000},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.86, "reset_in_seconds": 12000},
+            "gemini-weekly": {"remaining_fraction": 0.65, "reset_in_seconds": 360000},
+        },
+    },
+    "tool-use": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "feat/pixel-pet", "dirty": True},
+        "cycle_mode": "auto",
+        "agent_state": "tool_use",
+        "subagents": [{"name": "research", "role": "Codebase Researcher", "status": "running"}],
+        "model": {"id": "gemini-4-neon", "display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 22_000, "cache_read_input_tokens": 148_000},
+        },
+        "quota": {
+            "gemini-5h": {"remaining_fraction": 0.84, "reset_in_seconds": 11500},
+        },
+    },
+    "confirm": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "main", "dirty": False},
+        "agent_state": "tool_use",
+        "tool_confirmation_pending": True,
+        "model": {"display_name": "Gemini 4 Carbon"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 15_000, "cache_read_input_tokens": 80_000},
+        },
+        "quota": {"gemini-5h": {"remaining_fraction": 0.90, "reset_in_seconds": 14000}},
+    },
+    "error": {
+        "workspace": {"current_dir": str(Path.home() / "projects" / "mochan-skills")},
+        "vcs": {"type": "git", "branch": "fix/bug", "dirty": True},
+        "agent_state": "error",
+        "model": {"display_name": "Gemini 4 Neon (XHigh)"},
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": {"input_tokens": 30_000, "cache_read_input_tokens": 90_000},
+        },
+        "quota": {"gemini-5h": {"remaining_fraction": 0.82, "reset_in_seconds": 11000}},
     },
 }
 
@@ -474,6 +537,23 @@ def cmd_preview(args: argparse.Namespace) -> int:
         for name in names:
             payloads.append((name, copy.deepcopy(SCENARIOS[name]), False))
 
+    if (
+        getattr(args, "no_pet", False)
+        or getattr(args, "species", None)
+        or getattr(args, "pet_style", None)
+        or getattr(args, "pet_align", None)
+    ):
+        pet_cfg = dict(cfg.get("pet")) if isinstance(cfg.get("pet"), dict) else {}
+        if getattr(args, "no_pet", False):
+            pet_cfg["enabled"] = False
+        if getattr(args, "species", None):
+            pet_cfg["species"] = args.species
+        if getattr(args, "pet_style", None):
+            pet_cfg["style"] = args.pet_style
+        if getattr(args, "pet_align", None):
+            pet_cfg["align"] = args.pet_align
+        cfg["pet"] = pet_cfg
+
     tty_cols = shutil.get_terminal_size((100, 24)).columns
     default_w = args.width if args.width > 0 else min(tty_cols if tty_cols > 0 else 100, 100)
     for idx, (label, raw_payload, use_live_settings) in enumerate(payloads):
@@ -491,8 +571,10 @@ def cmd_preview(args: argparse.Namespace) -> int:
             settings=None if use_live_settings else {},
             data_dir=data_dir,
             no_color=bool(args.no_color),
+            no_pet=bool(getattr(args, "no_pet", False)),
         )
-        vis_w = renderer.display_width(line)
+        rendered_lines = line.splitlines()
+        vis_w = max((renderer.display_width(ln) for ln in rendered_lines), default=0)
         overflow = " OVERFLOW!" if vis_w > width else ""
         if idx > 0:
             print()
@@ -743,6 +825,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     cmd_exec = bool(cmd_is_file and cmd_path is not None and (not is_direct_exec or os.access(cmd_path, os.X_OK)))
     legacy_state = _legacy_file_state(legacy_path)
 
+    pet_cfg = cfg.get("pet") if isinstance(cfg.get("pet"), dict) else {}
+    pet_env = os.environ.get("AGY_STATUSLINE_PET", "").strip()
+    pet_report = {
+        "enabled": bool(pet_cfg.get("enabled", True)),
+        "effective_enabled": renderer.is_pet_enabled(cfg),
+        "env_override": pet_env or None,
+        "species": str(pet_cfg.get("species") or "gemini"),
+        "style": str(pet_cfg.get("style") or "pixel"),
+        "position": str(pet_cfg.get("position") or "above"),
+        "align": str(pet_cfg.get("align") or "right"),
+        "name": str(pet_cfg.get("name") or ""),
+        "show_bubble": bool(pet_cfg.get("show_bubble", True)),
+        "animate": bool(pet_cfg.get("animate", True)),
+    }
+
     report = {
         "skill_root": str(SKILL_ROOT),
         "renderer_path": str(RENDERER_PATH),
@@ -761,6 +858,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "theme": cfg.get("theme"),
         "left_segments": cfg.get("left_segments"),
         "right_segments": cfg.get("right_segments"),
+        "pet": pet_report,
         "legacy_file": legacy_state,
         "quota_snapshot": _quota_snapshot_info(data_dir),
     }
@@ -787,6 +885,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     if cfg_err:
         print(f"  config ERROR   : {cfg_err}")
     print(f"Theme / Segments : {report['theme']} | L={report['left_segments']} R={report['right_segments']}")
+    pet_state = "enabled" if pet_report["effective_enabled"] else "disabled"
+    pet_extra = f" [AGY_STATUSLINE_PET={pet_env}]" if pet_env else ""
+    pet_name_tag = f" name={pet_report['name']!r}" if pet_report["name"] else ""
+    print(
+        f"Pet              : {pet_state} ({pet_report['species']} · {pet_report['style']} · {pet_report['align']}/{pet_report['position']}{pet_name_tag}){pet_extra}"
+    )
     print(f"Legacy file      : {legacy_state}")
     q = report["quota_snapshot"]
     if q.get("error"):
@@ -884,6 +988,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 emit("WARN", f"Config {cfg_path}: unknown theme {raw_theme!r}, will fall back to tokyo-night")
             else:
                 emit("OK", f"Config valid JSON: {cfg_path} (theme={norm_theme})")
+        raw_pet = parsed_cfg.get("pet")
+        if raw_pet is not None:
+            if not isinstance(raw_pet, dict):
+                emit("WARN", f"Config {cfg_path}: pet must be an object (got {type(raw_pet).__name__})")
+            else:
+                pet_mod = _load_pet()
+                sp = raw_pet.get("species")
+                if sp is not None and (not isinstance(sp, str) or sp.strip().lower() not in pet_mod.SPECIES_LIST):
+                    emit("WARN", f"Config {cfg_path}: unknown pet.species {sp!r}, valid: {', '.join(pet_mod.SPECIES_LIST)}")
+                st = raw_pet.get("style")
+                if st is not None and (not isinstance(st, str) or st.strip().lower() not in pet_mod.STYLES_LIST):
+                    emit("WARN", f"Config {cfg_path}: unknown pet.style {st!r}, valid: {', '.join(pet_mod.STYLES_LIST)}")
+                pos = raw_pet.get("position")
+                if pos is not None and (not isinstance(pos, str) or pos.strip().lower() not in pet_mod.POSITIONS_LIST):
+                    emit("WARN", f"Config {cfg_path}: unknown pet.position {pos!r}, valid: {', '.join(pet_mod.POSITIONS_LIST)}")
+                al = raw_pet.get("align")
+                if al is not None and (not isinstance(al, str) or al.strip().lower() not in pet_mod.ALIGNS_LIST):
+                    emit("WARN", f"Config {cfg_path}: unknown pet.align {al!r}, valid: {', '.join(pet_mod.ALIGNS_LIST)}")
 
     # 5. Live subprocess smoke & latency check (mirrors agy `sh -c` invocation)
     using_fallback = not (cmd_runnable and cmd_str)
@@ -915,10 +1037,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         lines = proc.stdout.splitlines()
         if proc.returncode != 0:
             emit("FAIL", f"{smoke_label} exited {proc.returncode}: {proc.stderr.strip()}")
-        elif len(lines) != 1 or not lines[0].strip():
-            emit("FAIL", f"{smoke_label} expected 1 non-empty line, got {len(lines)}")
+        elif not (1 <= len(lines) <= 6) or not any(ln.strip() for ln in lines):
+            emit("FAIL", f"{smoke_label} expected 1..6 non-empty lines, got {len(lines)}")
         else:
-            vis_w = renderer.display_width(lines[0])
+            vis_w = max((renderer.display_width(ln) for ln in lines), default=0)
+            line_count = len(lines)
             if vis_w > 100:
                 emit("FAIL", f"{smoke_label} width {vis_w} exceeds terminal_width 100")
             else:
@@ -934,18 +1057,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     )
                     elapsed_ms = (time.perf_counter() - t1) * 1000.0
                     lines2 = proc2.stdout.splitlines()
-                    if proc2.returncode != 0 or len(lines2) != 1 or not lines2[0].strip():
+                    if proc2.returncode != 0 or not (1 <= len(lines2) <= 6) or not any(ln.strip() for ln in lines2):
                         emit("FAIL", f"{smoke_label} retry failed (rc={proc2.returncode}): {proc2.stderr.strip()}")
                         lines2 = []
-                    elif renderer.display_width(lines2[0]) > 100:
-                        emit("FAIL", f"{smoke_label} retry width {renderer.display_width(lines2[0])} exceeds 100")
-                        lines2 = []
                     else:
-                        vis_w = renderer.display_width(lines2[0])
+                        vis_w2 = max((renderer.display_width(ln) for ln in lines2), default=0)
+                        if vis_w2 > 100:
+                            emit("FAIL", f"{smoke_label} retry width {vis_w2} exceeds 100")
+                            lines2 = []
+                        else:
+                            vis_w = vis_w2
+                            line_count = len(lines2)
                     if not lines2:
                         vis_w = -1
                 if vis_w >= 0:
-                    emit("OK", f"{smoke_label} passed in {elapsed_ms:.1f}ms (width={vis_w}/100)")
+                    emit("OK", f"{smoke_label} passed in {elapsed_ms:.1f}ms (width={vis_w}/100, lines={line_count})")
                     if elapsed_ms >= 100.0:
                         emit("WARN", f"{smoke_label} steady-state latency high: {elapsed_ms:.1f}ms (target < 100ms)")
     except Exception as exc:
@@ -965,6 +1091,216 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         emit("WARN", f"quota_snapshot.json not created yet ({q['path']})")
 
     return 1 if failures else 0
+
+
+def _resolve_writable_config_path(data_dir: Path) -> Path:
+    """Resolve the active config file path to mutate while preserving statusline.py precedence."""
+    env_cfg = os.environ.get("AGY_STATUSLINE_CONFIG", "").strip()
+    if env_cfg:
+        return Path(env_cfg).expanduser()
+    local_cfg = SKILL_ROOT / "config.local.json"
+    global_cfg = data_dir / "statusline.json"
+    if _path_exists_no_follow(local_cfg) or not _path_exists_no_follow(global_cfg):
+        return local_cfg
+    return global_cfg
+
+
+def _mutate_pet_config(data_dir: Path, updates: dict) -> tuple[Path | None, dict | None, str | None]:
+    """Read, update `pet` fields, and atomically persist config without clobbering other keys."""
+    target = _resolve_writable_config_path(data_dir)
+    raw_cfg: dict = {}
+    if _path_exists_no_follow(target):
+        if target.is_symlink() and not target.exists():
+            return target, None, f"Refusing to write through dangling symlink: {target}"
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except PermissionError as exc:
+            return target, None, f"Permission denied reading {target}: {exc}"
+        except Exception as exc:
+            return target, None, f"Refusing to modify malformed config {target}: {exc}"
+        if not isinstance(parsed, dict):
+            return target, None, f"Config must be a JSON object: {target}"
+        raw_cfg = parsed
+
+    pet_section = dict(raw_cfg.get("pet")) if isinstance(raw_cfg.get("pet"), dict) else {}
+    pet_section.update(updates)
+    raw_cfg["pet"] = pet_section
+    try:
+        atomic_write_json(target, raw_cfg, backup=False)
+    except PermissionError as exc:
+        return target, None, f"Permission denied writing {target}: {exc}"
+    except OSError as exc:
+        return target, None, f"Failed writing {target}: {exc}"
+
+    merged = renderer._deep_merge(renderer.DEFAULT_CONFIG, raw_cfg)
+    return target, merged, None
+
+
+def _print_pet_env_notice() -> None:
+    env_flag = os.environ.get("AGY_STATUSLINE_PET", "").strip()
+    if env_flag:
+        print(
+            f"Note: AGY_STATUSLINE_PET={env_flag!r} is set in this shell and overrides config.pet.enabled.",
+            file=sys.stderr,
+        )
+
+
+def _run_pet_demo(args: argparse.Namespace, cfg: dict) -> int:
+    pet_mod = _load_pet()
+    pet_cfg = dict(cfg.get("pet")) if isinstance(cfg.get("pet"), dict) else {}
+    species_arg = args.species or str(pet_cfg.get("species") or "gemini")
+    style_arg = args.style or str(pet_cfg.get("style") or "pixel")
+    pal = renderer.build_palette(cfg, no_color=bool(args.no_color))
+    term_w = min(shutil.get_terminal_size((80, 24)).columns, 80)
+
+    demo_cfg = copy.deepcopy(cfg)
+    demo_cfg["pet"] = dict(pet_cfg, enabled=True, style=style_arg, animate=True)
+
+    # Static gallery across Gemini variants
+    if species_arg == "all":
+        sample = copy.deepcopy(SCENARIOS["working"])
+        for idx, sp in enumerate(pet_mod.SPECIES_LIST):
+            demo_cfg["pet"]["species"] = sp
+            if idx > 0:
+                print()
+            if style_arg == "inline":
+                print(f"[{sp}]  {pet_mod.render_inline_pet(sample, demo_cfg, pal, now=0.0)}")
+            else:
+                lines = pet_mod.render_pet_lines(sample, demo_cfg, pal, term_w, target_width=term_w - 2, now=0.0)
+                print(f"[{sp} | {style_arg} | {demo_cfg['pet'].get('align', 'right')}]")
+                print("\n".join(lines))
+        return 0
+
+    demo_cfg["pet"]["species"] = species_arg
+    mood_samples: list[tuple[str, dict]] = [
+        ("idle", copy.deepcopy(SCENARIOS["default"])),
+        ("working", copy.deepcopy(SCENARIOS["working"])),
+        ("tool_use", copy.deepcopy(SCENARIOS["tool-use"])),
+        ("confirm", copy.deepcopy(SCENARIOS["confirm"])),
+        ("error", copy.deepcopy(SCENARIOS["error"])),
+        ("sleep", {"agent_state": "idle", "context_window": {}}),
+    ]
+
+    if args.static or not sys.stdout.isatty():
+        for idx, (label, payload) in enumerate(mood_samples):
+            if idx > 0:
+                print()
+            if style_arg == "inline":
+                f0 = pet_mod.render_inline_pet(payload, demo_cfg, pal, now=0.0)
+                f1 = pet_mod.render_inline_pet(payload, demo_cfg, pal, now=2.4)
+                print(f"[{species_arg} · {label}]  {f0}   {f1}")
+            else:
+                lines = pet_mod.render_pet_lines(payload, demo_cfg, pal, term_w, target_width=term_w - 2, now=0.0)
+                print(f"[{species_arg} · {label}]")
+                print("\n".join(lines))
+        return 0
+
+    # Live terminal bounce preview
+    total_frames = max(2, int(args.frames))
+    painted_lines = 0
+    try:
+        sys.stdout.write("\033[?25l")
+        for step in range(total_frames):
+            _, payload = mood_samples[(step // 4) % len(mood_samples)]
+            now_ts = step * 0.45
+            if style_arg == "inline":
+                out_lines = [f" {pet_mod.render_inline_pet(payload, demo_cfg, pal, now=now_ts)}  ({species_arg} · frame {step + 1}/{total_frames})"]
+            else:
+                out_lines = pet_mod.render_pet_lines(payload, demo_cfg, pal, term_w, target_width=term_w - 2, now=now_ts)
+            if painted_lines > 0:
+                sys.stdout.write(f"\033[{painted_lines}A")
+            for ln in out_lines:
+                sys.stdout.write(f"\r\033[2K{ln}\n")
+            sys.stdout.flush()
+            painted_lines = len(out_lines)
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+    return 0
+
+
+def cmd_pet(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    action = getattr(args, "pet_action", None) or "status"
+    cfg_path, cfg, cfg_err = _inspect_config_for_cli(data_dir)
+    pet_cfg = cfg.get("pet") if isinstance(cfg.get("pet"), dict) else {}
+
+    if action == "status":
+        if cfg_err:
+            print(f"Warning: {cfg_err} (using defaults)", file=sys.stderr)
+        env_flag = os.environ.get("AGY_STATUSLINE_PET", "").strip()
+        info = {
+            "enabled": bool(pet_cfg.get("enabled", True)),
+            "effective_enabled": renderer.is_pet_enabled(cfg),
+            "env_override": env_flag or None,
+            "species": str(pet_cfg.get("species") or "gemini"),
+            "style": str(pet_cfg.get("style") or "pixel"),
+            "position": str(pet_cfg.get("position") or "above"),
+            "align": str(pet_cfg.get("align") or "right"),
+            "name": str(pet_cfg.get("name") or ""),
+            "show_bubble": bool(pet_cfg.get("show_bubble", True)),
+            "animate": bool(pet_cfg.get("animate", True)),
+            "config_source": str(cfg_path) if cfg_path else "built-in defaults",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(info, indent=2, ensure_ascii=False))
+            return 0
+        state_str = "ON" if info["effective_enabled"] else "OFF"
+        print(f"Pet status   : {state_str}" + (f" (AGY_STATUSLINE_PET={env_flag})" if env_flag else ""))
+        print(f"Species      : {info['species']}  (choices: gemini, prism)")
+        print(f"Style        : {info['style']}  (choices: pixel, inline, ascii)")
+        print(f"Align / Pos  : {info['align']} / {info['position']}  (align: right|left, position: above|below)")
+        print(f"Name         : {info['name'] or '(species default)'}")
+        print(f"Bubble/Anim  : bubble={info['show_bubble']}  animate={info['animate']}")
+        print(f"Config       : {info['config_source']}")
+        return 0
+
+    if action == "demo":
+        return _run_pet_demo(args, cfg)
+
+    updates: dict = {}
+    if action == "on":
+        updates = {"enabled": True}
+    elif action == "off":
+        updates = {"enabled": False}
+    elif action == "toggle":
+        current_enabled = bool(pet_cfg.get("enabled", True))
+        updates = {"enabled": not current_enabled}
+    elif action == "species":
+        updates = {"species": args.value}
+    elif action == "style":
+        updates = {"style": args.value}
+    elif action == "position":
+        updates = {"position": args.value}
+    elif action == "align":
+        updates = {"align": args.value}
+    elif action == "name":
+        new_name = "" if getattr(args, "clear", False) else (args.value or "")
+        updates = {"name": renderer._sanitize_single_line(new_name)}
+    elif action == "bubble":
+        updates = {"show_bubble": args.value == "on"}
+    elif action == "animate":
+        updates = {"animate": args.value == "on"}
+    else:
+        print(f"Unknown pet action: {action}", file=sys.stderr)
+        return 1
+
+    target, merged, err = _mutate_pet_config(data_dir, updates)
+    if err or merged is None:
+        print(err or "Failed to update pet config", file=sys.stderr)
+        return 1
+
+    new_pet = merged.get("pet", {})
+    state_label = "ON" if new_pet.get("enabled", True) else "OFF"
+    print(
+        f"Pet updated: {state_label} ({new_pet.get('species')} · {new_pet.get('style')} · {new_pet.get('align')}/{new_pet.get('position')}) -> {target}"
+    )
+    if action in ("on", "off", "toggle"):
+        _print_pet_env_notice()
+    return 0
 
 
 def cmd_init_config(args: argparse.Namespace) -> int:
@@ -1008,6 +1344,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_prev.add_argument("--json-input", default="", help="Read payload JSON from file path or '-' for stdin")
     p_prev.add_argument("--config", default="", help="Test with an alternate config JSON file")
     p_prev.add_argument("--no-color", action="store_true", help="Disable ANSI colors in preview")
+    p_prev.add_argument("--no-pet", action="store_true", help="Hide pixel pet in preview")
+    p_prev.add_argument(
+        "--species",
+        choices=["gemini", "prism"],
+        default=None,
+        help="Override pet variant in preview",
+    )
+    p_prev.add_argument(
+        "--pet-style",
+        choices=["pixel", "inline", "ascii"],
+        default=None,
+        help="Override pet style in preview",
+    )
+    p_prev.add_argument(
+        "--pet-align",
+        choices=["right", "left"],
+        default=None,
+        help="Override pet horizontal alignment in preview",
+    )
     p_prev.add_argument("--data-dir", default=None, help="Override AGY data directory")
     p_prev.set_defaults(func=cmd_preview)
 
@@ -1045,6 +1400,65 @@ def build_parser() -> argparse.ArgumentParser:
     p_init = sub.add_parser("init-config", help="Create config.local.json from config.example.json")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config.local.json")
     p_init.set_defaults(func=cmd_init_config)
+
+    p_pet = sub.add_parser("pet", help="Enable, disable, customize, or preview the pixel pet companion")
+    p_pet.add_argument("--data-dir", default=None, help="Override AGY data directory")
+    p_pet.set_defaults(func=cmd_pet, pet_action="status", json=False)
+    pet_sub = p_pet.add_subparsers(dest="pet_action", required=False)
+
+    for act_name, act_help in (
+        ("on", "Enable the pixel pet companion"),
+        ("off", "Disable the pixel pet companion (1-line status bar)"),
+        ("toggle", "Toggle the pixel pet companion on/off"),
+    ):
+        p_act = pet_sub.add_parser(act_name, help=act_help)
+        p_act.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pstat = pet_sub.add_parser("status", help="Show current pet configuration")
+    p_pstat.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+    p_pstat.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    p_psp = pet_sub.add_parser("species", help="Select Gemini mascot palette variant")
+    p_psp.add_argument("value", choices=["gemini", "prism"])
+    p_psp.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pst = pet_sub.add_parser("style", help="Select pet rendering style")
+    p_pst.add_argument("value", choices=["pixel", "inline", "ascii"])
+    p_pst.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_ppos = pet_sub.add_parser("position", help="Select multi-line pet placement relative to status bar")
+    p_ppos.add_argument("value", choices=["above", "below"])
+    p_ppos.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_paln = pet_sub.add_parser("align", help="Select horizontal pet alignment")
+    p_paln.add_argument("value", choices=["right", "left"])
+    p_paln.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pname = pet_sub.add_parser("name", help="Set or clear a custom pet name")
+    p_pname.add_argument("value", nargs="?", default="", help="Custom name shown in bubble (omit or --clear to reset)")
+    p_pname.add_argument("--clear", action="store_true", help="Clear custom pet name")
+    p_pname.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pbub = pet_sub.add_parser("bubble", help="Show or hide the speech bubble")
+    p_pbub.add_argument("value", choices=["on", "off"])
+    p_pbub.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pani = pet_sub.add_parser("animate", help="Enable or disable frame animation")
+    p_pani.add_argument("value", choices=["on", "off"])
+    p_pani.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
+
+    p_pdemo = pet_sub.add_parser("demo", help="Preview Gemini mascot variants and bouncing animations in terminal")
+    p_pdemo.add_argument(
+        "--species",
+        choices=["all", "gemini", "prism"],
+        default=None,
+        help="Mascot variant to preview (use 'all' for both gemini and prism)",
+    )
+    p_pdemo.add_argument("--style", choices=["pixel", "inline", "ascii"], default=None, help="Rendering style")
+    p_pdemo.add_argument("--static", action="store_true", help="Print static mood sheet instead of live animation")
+    p_pdemo.add_argument("--frames", type=int, default=16, help="Number of animation ticks in live demo")
+    p_pdemo.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    p_pdemo.add_argument("--data-dir", default=argparse.SUPPRESS, help="Override AGY data directory")
 
     return parser
 

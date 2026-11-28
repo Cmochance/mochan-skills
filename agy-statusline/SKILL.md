@@ -9,7 +9,7 @@ description: >-
 
 # agy-statusline — Custom Antigravity CLI Statusline
 
-Pure-stdlib single-line statusline renderer for `agy` (`scripts/statusline.py`) paired with the management CLI (`scripts/agy-statusline`, symlinked to `~/.local/bin/agy-statusline`).
+Pure-stdlib statusline renderer for `agy` (`scripts/statusline.py` + optional animated pixel pet in `scripts/pet.py`) paired with the management CLI (`scripts/agy-statusline`, symlinked to `~/.local/bin/agy-statusline`).
 
 > **Config precedence**: `AGY_STATUSLINE_CONFIG` env var → `config.local.json` alongside this `SKILL.md` (template: [config.example.json](./config.example.json), gitignored) → `<AGY_DATA_DIR>/statusline.json` → built-in `tokyo-night` defaults.
 
@@ -20,8 +20,21 @@ Invoke `agy-statusline` directly as a standalone command (avoid chaining `&&`, p
 ```bash
 # Pure sandbox (BypassSandbox: false)
 agy-statusline preview
-agy-statusline preview --scenario narrow --width 64
+agy-statusline preview --scenario working
+agy-statusline preview --scenario narrow --width 64 --no-pet
 agy-statusline preview --from-debug
+agy-statusline pet status
+agy-statusline pet demo --species all --static
+
+# Toggle or customize Gemini pixel mascot (writes config.local.json / active config)
+agy-statusline pet off             # Disable pet (back to clean 1-line bar)
+agy-statusline pet on              # Re-enable pet
+agy-statusline pet toggle          # Flip pet on/off
+agy-statusline pet species prism   # gemini (purple pixel cat) | prism (rainbow aurora)
+agy-statusline pet style inline    # pixel (5-row TrueColor) | inline (1-line) | ascii (5-row)
+agy-statusline pet align right     # right (default, flush with bar right edge) | left
+agy-statusline pet position below  # above (default) | below
+agy-statusline pet name Gemini     # custom bubble name (pass --clear to reset)
 
 # Writes outside active workspace or touches ~/.gemini/antigravity-cli/ (BypassSandbox: true)
 agy-statusline init-config
@@ -42,8 +55,9 @@ agy-statusline uninstall          # sets enabled=false; pass --remove to delete 
 ### Customize Style, Segments, or Thresholds
 1. If `config.local.json` does not exist yet, run `agy-statusline init-config`.
 2. Edit `config.local.json`:
-   - Supported top-level keys: `theme` (`tokyo-night` | `minimal` | `plain`), `no_color`, `separator`, `left_segments` (`path`, `worktree`), `right_segments` (`permission`, `model`, `context`, `cache`, `quota`), `path`, `worktree` (`icon`, `show_dirty`, `label` = `branch` | `name`, `auto_detect_from_transcript`, `auto_prefix`), `cache` (`icon`, `style` = `percent` | `tokens` | `both`, `hide_when_empty`), `permission`, `thresholds`, `quota`, `layout`, `colors`.
+   - Supported top-level keys: `theme` (`tokyo-night` | `minimal` | `plain`), `no_color`, `separator`, `left_segments` (`path`, `worktree`), `right_segments` (`permission`, `model`, `context`, `cache`, `quota`), `path`, `worktree` (`icon`, `show_dirty`, `label` = `branch` | `name`, `auto_detect_from_transcript`, `auto_prefix`), `cache` (`icon`, `style` = `percent` | `tokens` | `both`, `hide_when_empty`), `permission`, `thresholds`, `quota`, `layout`, `pet` (`enabled`, `species` = `gemini` | `prism`, `style` = `pixel` | `inline` | `ascii`, `position` = `above` | `below`, `align` = `right` | `left`, `name`, `show_bubble`, `animate`), `colors`.
    - Valid `colors` slot keys (256-color int `0..255` or SGR ANSI string): `path`, `wt_linked`, `wt_main`, `sep`, `model`, `muted`, `green`, `amber`, `red`, `sky`, `teal`, `yellow`.
+   - One-shot session toggle: set `AGY_STATUSLINE_PET=0` (or `off`) to temporarily hide the pet without modifying config, or `AGY_STATUSLINE_PET=1` to force it on. When disabled, `scripts/pet.py` is not imported (zero latency cost).
 3. Verify visually with `agy-statusline preview --scenario all` (and test `--width 60` for narrow terminals).
 
 ### Troubleshoot Missing Fields (`--`) or Layout Overflow
@@ -59,6 +73,6 @@ agy-statusline uninstall          # sets enabled=false; pass --remove to delete 
 ## 3. Hard Rules
 
 1. **Hot-path performance**: `scripts/statusline.py` MUST stay pure Python stdlib with **zero subprocess calls** (never spawn `git`) and **zero network requests**; cold-start render time must stay well under 50–100ms.
-2. **Clean single-line stdout**: Never print warnings or debug text to `stdout`; all failures degrade silently to `--` or empty segments.
+2. **Clean stdout**: Never print warnings or debug text to `stdout`; all failures degrade silently to `--` or empty segments, and every emitted line (single-line bar or optional multi-line pet block) must fit strictly within `terminal_width`.
 3. **Safe `settings.json` writes**: Always mutate `~/.gemini/antigravity-cli/settings.json` through `agy-statusline install` / `uninstall` (strict JSON parse + `.bak` backup + atomic `os.replace`), never hand-overwrite.
 4. **Preserve `agy-stats` contract**: Keep `<data_dir>/cache/quota_snapshot.json` format (`{"updated_at": ..., "quota": ...}`) backward-compatible unless explicitly updating `agy-stats` together.

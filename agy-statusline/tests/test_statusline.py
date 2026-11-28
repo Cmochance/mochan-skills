@@ -18,6 +18,7 @@ from unittest import mock
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 RENDERER_PATH = SKILL_ROOT / "scripts" / "statusline.py"
+PET_PATH = SKILL_ROOT / "scripts" / "pet.py"
 CLI_PATH = SKILL_ROOT / "scripts" / "agy-statusline"
 AGY_STATS_PATH = SKILL_ROOT.parent / "agy-stats" / "scripts" / "agy-stats"
 
@@ -26,6 +27,8 @@ ISOLATED_ENV_KEYS = (
     "AGY_STATUSLINE_CONFIG",
     "AGY_STATUSLINE_NO_SNAPSHOT",
     "AGY_STATUSLINE_DEBUG",
+    "AGY_STATUSLINE_PET",
+    "AGY_STATUSLINE_PET_FRAME",
     "AGY_DATA_DIR",
     "COLUMNS",
 )
@@ -40,6 +43,7 @@ def load_module(name: str, path: Path):
 
 
 sl = load_module("agy_statusline_renderer_testmod", RENDERER_PATH)
+pet = load_module("agy_statusline_pet_testmod", PET_PATH)
 cli = load_module("agy_statusline_cli_testmod", CLI_PATH)
 
 
@@ -405,7 +409,7 @@ class StatuslineRendererTest(IsolatedTestCase):
 
         # 6. NUL bytes in current_dir or transcript_path never crash (F19a)
         bad_payload = {"workspace": {"current_dir": "/tmp/bad\x00dir/sub"}, "transcript_path": "/tmp/bad\x00.jsonl", "terminal_width": 80}
-        out_bad = sl.render(bad_payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir)
+        out_bad = sl.render(bad_payload, config=sl.DEFAULT_CONFIG, settings={}, data_dir=self.data_dir, no_pet=True)
         self.assertNotIn("\n", out_bad)
 
         # 7. Symlinked main repo path resolves Layer 1 cleanly
@@ -695,15 +699,19 @@ class StatuslineRendererTest(IsolatedTestCase):
             "--",
         )
         self.assertEqual(sl.format_tokens(float("nan")), "0")
-        out = sl.render({"terminal_width": float("inf"), "workspace": {"current_dir": "/tmp/demo"}}, config=cfg, settings={})
+        out = sl.render({"terminal_width": float("inf"), "workspace": {"current_dir": "/tmp/demo"}}, config=cfg, settings={}, no_pet=True)
         self.assertNotIn("\n", out)
         out_bool = sl.render({"terminal_width": True, "workspace": {"current_dir": "/tmp/demo"}}, config=sl.DEFAULT_CONFIG, settings={})
-        self.assertGreater(sl.display_width(out_bool), 10)  # bool ignored -> falls back to 100, not 1
+        self.assertGreater(sl.display_width(out_bool.splitlines()[-1]), 10)  # bool ignored -> falls back to 100, not 1
 
     def test_sanitization_blocks_newlines_and_terminal_escapes(self) -> None:
         cfg = sl._deep_merge(
             sl.DEFAULT_CONFIG,
-            {"separator": " \n· ", "colors": {"path": "\x1b]0;pwn\x07\x1b[31m", "model": "\033[38;5;250m"}},
+            {
+                "separator": " \n· ",
+                "colors": {"path": "\x1b]0;pwn\x07\x1b[31m", "model": "\033[38;5;250m"},
+                "pet": {"name": "mochi\x1b]0;pwn\x07\nline2"},
+            },
         )
         payload = {
             "workspace": {"current_dir": "file:///tmp/repo%0Ainjected%1B%5D0%3Bpwn%07"},
@@ -712,8 +720,10 @@ class StatuslineRendererTest(IsolatedTestCase):
             "credits": "100\t\x1b]8;;https://evil\x07click\x1b]8;;\x07",
             "terminal_width": 140,
         }
+        out_single = sl.render(payload, config=cfg, settings={}, data_dir=self.data_dir, no_pet=True)
+        self.assertNotIn("\n", out_single)
         out = sl.render(payload, config=cfg, settings={}, data_dir=self.data_dir)
-        self.assertNotIn("\n", out)
+        self.assertEqual(len(out.splitlines()), 6)
         self.assertNotIn("\r", out)
         self.assertNotIn("\t", out)
         self.assertNotIn("\x1b]", out)
@@ -727,6 +737,8 @@ class StatuslineRendererTest(IsolatedTestCase):
                 "worktree": {"name": "feature/very-long-worktree-branch-name"},
                 "vcs": {"dirty": True},
                 "cycle_mode": "auto",
+                "agent_state": "tool_use",
+                "subagents": [{"name": "r", "status": "running"}],
                 "model": {"display_name": "Gemini 4 Neon (XHigh)"},
                 "context_window": {
                     "context_window_size": 1_048_576,
@@ -738,6 +750,7 @@ class StatuslineRendererTest(IsolatedTestCase):
                 "workspace": {"current_dir": "/Users/demo/项目/中文目录/中文工程名"},
                 "vcs": {"branch": "功能/状态栏", "dirty": True},
                 "cycle_mode": "plan",
+                "agent_state": "working",
                 "model": {"display_name": "Gemini 4 Neon"},
                 "context_window": {
                     "context_window_size": 1_048_576,
@@ -749,18 +762,30 @@ class StatuslineRendererTest(IsolatedTestCase):
             {"workspace": {"current_dir": "/tmp/myproject"}, "cycle_mode": "auto", "model": "G4"},
         ]
         cfgs = [
-            sl.DEFAULT_CONFIG,
-            sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree"]}),
-            sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree", "path"], "worktree": {"icon": "🌿"}}),
-            sl._deep_merge(sl.DEFAULT_CONFIG, {"layout": {"right_margin": 0}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": False}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": True, "style": "pixel", "align": "right", "name": "墨酱小紫猫超长名字测试"}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": True, "style": "pixel", "align": "left", "species": "prism", "name": "墨酱小紫猫超长名字测试"}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": True, "style": "ascii", "align": "right"}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": True, "style": "inline", "align": "right"}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": True, "style": "inline", "align": "left"}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree"], "pet": {"enabled": False}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree", "path"], "worktree": {"icon": "🌿"}, "pet": {"enabled": False}}),
+            sl._deep_merge(sl.DEFAULT_CONFIG, {"layout": {"right_margin": 0}, "pet": {"enabled": False}}),
         ]
         for cfg in cfgs:
+            pet_enabled = cfg["pet"]["enabled"]
+            pet_style = cfg["pet"]["style"]
             for base in payloads:
-                for width in (140, 100, 84, 64, 48, 30, 20, 12, 5, 4, 2, 1):
+                for width in (140, 100, 84, 64, 48, 30, 24, 20, 19, 16, 12, 5, 4, 2, 1):
                     p = dict(base, terminal_width=width)
                     out = sl.render(p, config=cfg, settings={}, data_dir=self.data_dir)
-                    self.assertNotIn("\n", out)
-                    self.assertLessEqual(sl.display_width(out), width, f"overflowed at w={width}: {strip_ansi(out)!r}")
+                    lines = out.splitlines()
+                    if not pet_enabled or pet_style == "inline" or width < 20:
+                        self.assertEqual(len(lines), 1, f"expected single line at w={width}: {out!r}")
+                    else:
+                        self.assertEqual(len(lines), 6, f"expected 6 lines at w={width}: {out!r}")
+                    for ln in lines:
+                        self.assertLessEqual(sl.display_width(ln), width, f"overflowed at w={width}: {strip_ansi(ln)!r}")
 
     def test_left_right_segment_layout_variants_and_terminal_width_fallbacks(self) -> None:
         base = {
@@ -771,20 +796,22 @@ class StatuslineRendererTest(IsolatedTestCase):
             "terminal_width": 60,
         }
         # Reversed left segments
-        rev = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree", "path"]}), settings={}))
+        rev = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": ["worktree", "path"]}), settings={}, no_pet=True))
         self.assertTrue(rev.startswith("⎇ wt-1 /tmp/demo"))
 
         # Empty left -> right aligned
-        r_only = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": []}), settings={}))
+        r_only = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": []}), settings={}, no_pet=True))
         self.assertTrue(r_only.startswith(" "))
         self.assertIn("plan · G4", r_only)
 
         # Empty right -> left only
-        l_only = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"right_segments": []}), settings={}))
+        l_only = strip_ansi(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"right_segments": []}), settings={}, no_pet=True))
         self.assertEqual(l_only, "/tmp/demo ⎇ wt-1")
 
-        # Both empty -> ""
-        self.assertEqual(sl.render(base, config=sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": [], "right_segments": []}), settings={}), "")
+        # Both empty -> "" when pet off; 5 pet rows when pet on
+        empty_cfg = sl._deep_merge(sl.DEFAULT_CONFIG, {"left_segments": [], "right_segments": []})
+        self.assertEqual(sl.render(base, config=empty_cfg, settings={}, no_pet=True), "")
+        self.assertEqual(len(sl.render(base, config=empty_cfg, settings={}).splitlines()), 5)
 
         # COLUMNS env fallback & 0-col PTY fallback
         with mock.patch.dict(os.environ, {"COLUMNS": "72"}):
@@ -971,7 +998,20 @@ class StatuslineCliTest(IsolatedTestCase):
             env=clean_subprocess_env({"AGY_DATA_DIR": str(self.data_dir), "AGY_STATUSLINE_NO_SNAPSHOT": "1"}),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(len(proc.stdout.splitlines()), 1)
+        self.assertEqual(len(proc.stdout.splitlines()), 6)
+
+        proc_off = subprocess.run(
+            [str(legacy)],
+            input=json.dumps(cli.SCENARIOS["default"]),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            env=clean_subprocess_env(
+                {"AGY_DATA_DIR": str(self.data_dir), "AGY_STATUSLINE_NO_SNAPSHOT": "1", "AGY_STATUSLINE_PET": "0"}
+            ),
+        )
+        self.assertEqual(proc_off.returncode, 0, proc_off.stderr)
+        self.assertEqual(len(proc_off.stdout.splitlines()), 1)
 
         # Installing with --command pointing via resolved alias to standalone legacy must NOT archive itself
         alt_dir = self.root / "alt-agy"
@@ -1166,17 +1206,31 @@ class StatuslineCliTest(IsolatedTestCase):
         (self.data_dir / "settings.json").write_text(json.dumps({"model": "Gemini 4 Fallback", "agentMode": "plan"}), encoding="utf-8")
         env = clean_subprocess_env({"AGY_DATA_DIR": str(self.data_dir)})
 
-        # Valid payload
+        # Valid payload (default pet ON -> 5 pet rows + 1 bar row)
         sample = json.dumps(cli.SCENARIOS["default"])
         proc = subprocess.run([sys.executable, str(RENDERER_PATH)], input=sample, text=True, capture_output=True, timeout=5, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr, "")
         lines = proc.stdout.splitlines()
-        self.assertEqual(len(lines), 1)
-        plain = strip_ansi(lines[0])
+        self.assertEqual(len(lines), 6)
+        plain = strip_ansi(lines[-1])
         self.assertIn("Gemini 4 Neon (XHigh)", plain)
         self.assertIn("109k/1M · ⚡89%", plain)
         self.assertTrue((self.data_dir / "cache" / "quota_snapshot.json").is_file())
+
+        # Valid payload with AGY_STATUSLINE_PET=0 -> strict 1-line bar
+        proc_off = subprocess.run(
+            [sys.executable, str(RENDERER_PATH)],
+            input=sample,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            env=clean_subprocess_env(
+                {"AGY_DATA_DIR": str(self.data_dir), "AGY_STATUSLINE_NO_SNAPSHOT": "1", "AGY_STATUSLINE_PET": "0"}
+            ),
+        )
+        self.assertEqual(proc_off.returncode, 0, proc_off.stderr)
+        self.assertEqual(len(proc_off.stdout.splitlines()), 1)
 
         # Empty, malformed, and non-dict stdin never crash and fall back to settings.json
         for bad_in in ("", "{malformed", "[]", "null"):
@@ -1190,8 +1244,229 @@ class StatuslineCliTest(IsolatedTestCase):
             )
             self.assertEqual(p2.returncode, 0, f"failed for {bad_in!r}: {p2.stderr}")
             self.assertEqual(p2.stderr, "")
-            self.assertEqual(len(p2.stdout.splitlines()), 1)
-            self.assertIn("plan · Gemini 4 Fallback", strip_ansi(p2.stdout))
+            self.assertEqual(len(p2.stdout.splitlines()), 6)
+            self.assertIn("plan · Gemini 4 Fallback", strip_ansi(p2.stdout.splitlines()[-1]))
+
+
+class PetRendererAndCliTest(IsolatedTestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_sprite_geometry_colors_and_ascii_widths(self) -> None:
+        valid_pixels = set(pet.PIXEL_COLORS.keys()) | {".", " "}
+        expected_states = ("idle", "working", "tool_use", "confirm", "error", "sleep")
+        self.assertEqual(pet.SPECIES_LIST, ("gemini", "prism"))
+        for st in expected_states:
+            px_frames = pet.GEMINI_PIXEL_FRAMES[st]
+            self.assertGreaterEqual(len(px_frames), 2, f"{st} needs >= 2 animation frames")
+            for f_idx, grid in enumerate(px_frames):
+                self.assertEqual(len(grid), 10, f"{st}[{f_idx}] must have 10 pixel rows")
+                for r_idx, row in enumerate(grid):
+                    self.assertEqual(len(row), 16, f"{st}[{f_idx}] row {r_idx} must be 16 cols")
+                    self.assertTrue(set(row).issubset(valid_pixels), f"invalid pixel in {st}[{f_idx}]: {row!r}")
+
+            asc_frames = pet.GEMINI_ASCII_FRAMES[st]
+            self.assertGreaterEqual(len(asc_frames), 2)
+            for f_idx, rows in enumerate(asc_frames):
+                self.assertEqual(len(rows), 5, f"ascii {st}[{f_idx}] must have 5 rows")
+                for r_idx, row in enumerate(rows):
+                    self.assertEqual(sl.display_width(row), 16, f"ascii {st}[{f_idx}] row {r_idx} width != 16: {row!r}")
+
+            inl_frames = pet.GEMINI_INLINE_FRAMES[st]
+            self.assertGreaterEqual(len(inl_frames), 2)
+            for face in inl_frames:
+                self.assertGreaterEqual(sl.display_width(face), 6)
+                self.assertLessEqual(sl.display_width(face), 9)
+
+    def test_pet_toggle_config_env_and_lazy_import(self) -> None:
+        payload = {"workspace": {"current_dir": "/tmp/demo"}, "model": "G4", "terminal_width": 100}
+        cfg_off = sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"enabled": False}})
+        with mock.patch.object(sl, "_load_pet_module", side_effect=AssertionError("should not load pet when off")):
+            out_off = sl.render(payload, config=cfg_off, settings={})
+        self.assertEqual(len(out_off.splitlines()), 1)
+
+        with mock.patch.dict(os.environ, {"AGY_STATUSLINE_PET": "off"}):
+            with mock.patch.object(sl, "_load_pet_module", side_effect=AssertionError("env off must skip import")):
+                out_env_off = sl.render(payload, config=sl.DEFAULT_CONFIG, settings={})
+        self.assertEqual(len(out_env_off.splitlines()), 1)
+
+        with mock.patch.dict(os.environ, {"AGY_STATUSLINE_PET": "1"}):
+            out_env_on = sl.render(payload, config=cfg_off, settings={})
+        self.assertEqual(len(out_env_on.splitlines()), 6)
+
+    def test_pet_mood_state_machine_and_subagent_badge(self) -> None:
+        cfg = sl.DEFAULT_CONFIG
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "error"}, cfg), ("error", ""))
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "tool_use", "tool_confirmation_pending": True}, cfg), ("confirm", ""))
+        self.assertEqual(
+            pet.resolve_pet_mood(
+                {
+                    "agent_state": "tool_use",
+                    "subagents": [{"status": "running"}, {"status": "completed"}, {"status": "running"}],
+                },
+                cfg,
+            ),
+            ("tool_use", "+2 sub"),
+        )
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "working"}, cfg), ("working", ""))
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "initializing"}, cfg), ("working", ""))
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "reviewing"}, cfg), ("reviewing", ""))
+        self.assertEqual(pet.resolve_pet_mood({"context_window": {"used_percentage": 90.0}}, cfg), ("tired", ""))
+        self.assertEqual(pet.resolve_pet_mood({"quota": {"g-5h": {"remaining_fraction": 0.12}}}, cfg), ("hungry", ""))
+        self.assertEqual(pet.resolve_pet_mood({"agent_state": "idle", "context_window": {}}, cfg), ("sleep", ""))
+        self.assertEqual(
+            pet.resolve_pet_mood({"agent_state": "idle", "context_window": {"current_usage": {"input_tokens": 100}}}, cfg),
+            ("idle", ""),
+        )
+        # NaN/inf thresholds & payload values never crash
+        bad_cfg = sl._deep_merge(cfg, {"thresholds": {"context_critical_pct": float("nan"), "quota_warn_pct": float("inf")}})
+        self.assertEqual(pet.resolve_pet_mood({"context_window": {"used_percentage": float("nan")}}, bad_cfg), ("idle", ""))
+
+    def test_styles_alignment_positions_animation_and_no_color(self) -> None:
+        payload = {
+            "workspace": {"current_dir": "/tmp/demo"},
+            "agent_state": "working",
+            "model": "G4",
+            "terminal_width": 90,
+        }
+        pal_color = sl.build_palette(sl.DEFAULT_CONFIG)
+        pal_plain = sl.build_palette(sl.DEFAULT_CONFIG, no_color=True)
+
+        # Default right alignment: every pet line aligns flush to target_width (90 - 2 = 88)
+        out_default = sl.render(payload, config=sl.DEFAULT_CONFIG, settings={})
+        default_lines = out_default.splitlines()
+        self.assertEqual(len(default_lines), 6)
+        for ln in default_lines[:5]:
+            self.assertEqual(sl.display_width(ln), 88)
+        self.assertIn("─╮", strip_ansi(default_lines[1]))
+        self.assertIn("╰─", strip_ansi(default_lines[2]))
+
+        # Animation frame switches over time when animate=True, stays fixed when animate=False
+        f0 = pet.render_pet_lines(payload, sl.DEFAULT_CONFIG, pal_color, 90, target_width=88, now=0.0)
+        f1 = pet.render_pet_lines(payload, sl.DEFAULT_CONFIG, pal_color, 90, target_width=88, now=0.5)
+        self.assertNotEqual(f0, f1)
+        static_cfg = sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"animate": False}})
+        self.assertEqual(
+            pet.render_pet_lines(payload, static_cfg, pal_color, 90, target_width=88, now=0.0),
+            pet.render_pet_lines(payload, static_cfg, pal_color, 90, target_width=88, now=0.5),
+        )
+
+        # AGY_STATUSLINE_PET_FRAME pins deterministic frame
+        with mock.patch.dict(os.environ, {"AGY_STATUSLINE_PET_FRAME": "1"}):
+            self.assertEqual(pet.render_pet_lines(payload, sl.DEFAULT_CONFIG, pal_color, 90, target_width=88, now=0.0), f1)
+
+        # Position below places bar first, pet rows after
+        below_cfg = sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"position": "below", "species": "prism"}})
+        out_below = sl.render(payload, config=below_cfg, settings={})
+        lines_below = out_below.splitlines()
+        self.assertEqual(len(lines_below), 6)
+        self.assertIn("/tmp/demo", strip_ansi(lines_below[0]))
+        self.assertIn("prism", strip_ansi(lines_below[2]))
+
+        # Prism palette produces distinct RGB values from standard lavender gemini
+        gem_lines = pet.render_pet_lines(payload, sl.DEFAULT_CONFIG, pal_color, 90, target_width=88, now=0.0)
+        prism_lines = pet.render_pet_lines(
+            payload, sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"species": "prism"}}), pal_color, 90, target_width=88, now=0.0
+        )
+        self.assertNotEqual(gem_lines, prism_lines)
+
+        # NO_COLOR emits zero ANSI escape codes across all variants, styles, and alignments
+        for sp in pet.SPECIES_LIST:
+            for st in pet.STYLES_LIST:
+                for al in pet.ALIGNS_LIST:
+                    c = sl._deep_merge(sl.DEFAULT_CONFIG, {"pet": {"species": sp, "style": st, "align": al}})
+                    out = sl.render(payload, config=c, settings={}, no_color=True)
+                    self.assertNotIn("\x1b", out, f"ANSI leak in no_color mode for {sp}/{st}/{al}")
+                    for ln in out.splitlines():
+                        self.assertLessEqual(sl.display_width(ln), 90)
+                    if st == "inline":
+                        self.assertEqual(len(out.splitlines()), 1)
+                    else:
+                        self.assertEqual(len(out.splitlines()), 6)
+
+        # Half-block monochrome fallback still renders 5 sprite lines
+        mono = pet.render_pet_lines(payload, sl.DEFAULT_CONFIG, pal_plain, 90, target_width=88, now=0.0)
+        self.assertEqual(len(mono), 5)
+        self.assertTrue(all("\x1b" not in ln for ln in mono))
+
+    def test_pet_cli_toggle_customize_demo_and_config_preservation(self) -> None:
+        local_cfg = self.fake_skill_root / "config.local.json"
+        local_cfg.write_text(json.dumps({"theme": "minimal", "separator": " | "}), encoding="utf-8")
+
+        # Toggle off -> preserves unrelated config keys
+        code, out, err = self._run_cli(["pet", "off", "--data-dir", str(self.data_dir)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("OFF", out)
+        saved = json.loads(local_cfg.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "minimal")
+        self.assertEqual(saved["separator"], " | ")
+        self.assertFalse(saved["pet"]["enabled"])
+
+        # Toggle flips False -> True; test --data-dir BEFORE sub-action too
+        code_t, out_t, err_t = self._run_cli(["pet", "--data-dir", str(self.data_dir), "toggle"])
+        self.assertEqual(code_t, 0, err_t)
+        self.assertIn("ON", out_t)
+        self.assertTrue(json.loads(local_cfg.read_text(encoding="utf-8"))["pet"]["enabled"])
+
+        # Species, style, align, position, name, bubble, animate
+        for argv in (
+            ["pet", "species", "prism", "--data-dir", str(self.data_dir)],
+            ["pet", "style", "inline", "--data-dir", str(self.data_dir)],
+            ["pet", "align", "left", "--data-dir", str(self.data_dir)],
+            ["pet", "position", "below", "--data-dir", str(self.data_dir)],
+            ["pet", "name", "墨酱\x1b]0;bad\x07", "--data-dir", str(self.data_dir)],
+            ["pet", "bubble", "off", "--data-dir", str(self.data_dir)],
+            ["pet", "animate", "off", "--data-dir", str(self.data_dir)],
+        ):
+            c, _, e = self._run_cli(argv)
+            self.assertEqual(c, 0, f"failed {argv}: {e}")
+
+        code_s, out_s, _ = self._run_cli(["pet", "status", "--json", "--data-dir", str(self.data_dir)])
+        self.assertEqual(code_s, 0)
+        info = json.loads(out_s)
+        self.assertTrue(info["enabled"])
+        self.assertEqual(info["species"], "prism")
+        self.assertEqual(info["style"], "inline")
+        self.assertEqual(info["align"], "left")
+        self.assertEqual(info["position"], "below")
+        self.assertEqual(info["name"], "墨酱")
+        self.assertFalse(info["show_bubble"])
+        self.assertFalse(info["animate"])
+
+        # Name --clear resets custom name
+        c_clr, _, _ = self._run_cli(["pet", "name", "--clear", "--data-dir", str(self.data_dir)])
+        self.assertEqual(c_clr, 0)
+        self.assertEqual(json.loads(local_cfg.read_text(encoding="utf-8"))["pet"]["name"], "")
+
+        # Demo static gallery & single variant
+        c_all, out_all, err_all = self._run_cli(["pet", "demo", "--species", "all", "--static", "--no-color", "--data-dir", str(self.data_dir)])
+        self.assertEqual(c_all, 0, err_all)
+        for sp in pet.SPECIES_LIST:
+            self.assertIn(f"[{sp}", out_all)
+        c_one, out_one, err_one = self._run_cli(["pet", "demo", "--species", "gemini", "--style", "ascii", "--static", "--no-color", "--data-dir", str(self.data_dir)])
+        self.assertEqual(c_one, 0, err_one)
+        self.assertIn("[gemini · working]", out_one)
+
+        # Preview --no-pet overrides even when AGY_STATUSLINE_PET=1 is set in env
+        with mock.patch.dict(os.environ, {"AGY_STATUSLINE_PET": "1"}):
+            c_prev, out_prev, err_prev = self._run_cli(
+                ["preview", "--scenario", "working", "--no-pet", "--no-color", "--width", "100", "--data-dir", str(self.data_dir)]
+            )
+        self.assertEqual(c_prev, 0, err_prev)
+        self.assertNotIn("OVERFLOW!", out_prev)
+        self.assertEqual(len(out_prev.strip().splitlines()), 2)
+
+        # If only <data_dir>/statusline.json exists (no config.local.json), pet mutates it instead of shadowing
+        local_cfg.unlink()
+        global_cfg = self.data_dir / "statusline.json"
+        global_cfg.write_text(json.dumps({"theme": "tokyo-night"}), encoding="utf-8")
+        c_glob, _, err_glob = self._run_cli(["pet", "off", "--data-dir", str(self.data_dir)])
+        self.assertEqual(c_glob, 0, err_glob)
+        self.assertFalse(local_cfg.exists())
+        self.assertFalse(json.loads(global_cfg.read_text(encoding="utf-8"))["pet"]["enabled"])
 
 
 if __name__ == "__main__":
